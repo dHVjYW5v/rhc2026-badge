@@ -1,6 +1,7 @@
 #include <Tactility/RecursiveMutex.h>
 #include <Tactility/Timer.h>
 #include <Tactility/app/wificonnect/WifiConnect.h>
+#include <Tactility/service/neopixel/NeoPixel.h>
 #include <Tactility/service/wifi/Wifi.h>
 
 #include <app/event.h>
@@ -110,6 +111,16 @@ struct Context {
     uint32_t detailBeaconBaseline = 0;
     int nextColor = 0; // running counter for assigning SeenAp::colorIndex
     RadioMode mode = RadioMode::ActiveScan;
+
+    // LED strip: the config to put back on exit/stop, and a cache of what we last pushed so we
+    // don't restart the animation every refresh.
+    bool ledSaved = false;
+    service::neopixel::Animation savedAnim = service::neopixel::Animation::Off;
+    service::neopixel::ColorMode savedColorMode = service::neopixel::ColorMode::Static;
+    uint8_t savedR = 0, savedG = 0, savedB = 0, savedBrightness = 0, savedSpeed = 0;
+    int ledViewApplied = -1;   // 0 scan, 1 capture, 2 stopped, 3 detail
+    int ledColorApplied = -1;
+    int ledBrightnessApplied = -1;
 
     lv_obj_t* toolbar = nullptr;
     lv_obj_t* statusLabel = nullptr;
@@ -511,6 +522,99 @@ void mergeActiveScan(Context* ctx, const std::vector<WifiApRecord>& records) {
     }
 }
 
+// ---- LED strip (NeoPixel) feedback ----
+
+void saveLedConfig(Context* ctx) {
+    namespace np = service::neopixel;
+    ctx->savedAnim = np::getActiveAnimation();
+    ctx->savedColorMode = np::getActiveColorMode();
+    np::getActiveColor(&ctx->savedR, &ctx->savedG, &ctx->savedB);
+    ctx->savedBrightness = np::getActiveBrightness();
+    ctx->savedSpeed = np::getActiveSpeed();
+    ctx->ledSaved = true;
+}
+
+void restoreLedConfig(Context* ctx) {
+    namespace np = service::neopixel;
+    if (!ctx->ledSaved) return;
+    np::setActiveColorMode(ctx->savedColorMode);
+    np::setActiveColor(ctx->savedR, ctx->savedG, ctx->savedB);
+    np::setActiveSpeed(ctx->savedSpeed);
+    np::setActiveBrightness(ctx->savedBrightness);
+    np::setActiveAnimation(ctx->savedAnim);
+}
+
+/** Drives the strip from the current page/mode/selection. Caches what was last pushed so the
+ * animation isn't restarted on every 1 s refresh; only real changes are applied. */
+void updateLeds(Context* ctx) {
+    namespace np = service::neopixel;
+
+    Page page;
+    RadioMode mode;
+    uint64_t selectedKey;
+    if (ctx->mutex.lock(0)) {
+        page = ctx->page;
+        mode = ctx->mode;
+        selectedKey = ctx->selectedKey;
+        ctx->mutex.unlock();
+    } else {
+        return;
+    }
+
+    if (page == Page::Detail) {
+        int colorIdx = 0;
+        int8_t rssi = SIGNAL_FLOOR_DBM;
+        bool found = false;
+        if (ctx->mutex.lock(0)) {
+            auto it = ctx->seen.find(selectedKey);
+            if (it != ctx->seen.end()) {
+                colorIdx = it->second.colorIndex % MAX_SERIES;
+                rssi = it->second.record.rssi;
+                found = true;
+            }
+            ctx->mutex.unlock();
+        }
+        if (!found) return;
+
+        // Brightness rises with the signal: the closer to the AP, the brighter, up to 100%.
+        int32_t peak = std::clamp<int32_t>(rssi - SIGNAL_FLOOR_DBM, 1, SIGNAL_RANGE_DB);
+        int brightness = (int)(peak * 100 / SIGNAL_RANGE_DB);
+        if (ctx->ledViewApplied == 3 && ctx->ledColorApplied == colorIdx && ctx->ledBrightnessApplied == brightness) {
+            return;
+        }
+        ctx->ledViewApplied = 3;
+        ctx->ledColorApplied = colorIdx;
+        ctx->ledBrightnessApplied = brightness;
+
+        uint32_t color = SERIES_COLORS[colorIdx];
+        np::setActiveColorMode(np::ColorMode::Static);
+        np::setActiveColor((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
+        np::setActiveAnimation(np::Animation::Solid);
+        np::setActiveBrightness((uint8_t)brightness);
+        return;
+    }
+
+    // Graph / list: the strip reflects the capture state.
+    int view = mode == RadioMode::Capture ? 1 : (mode == RadioMode::ActiveScan ? 0 : 2);
+    if (ctx->ledViewApplied == view) return;
+    ctx->ledViewApplied = view;
+    ctx->ledColorApplied = -1;
+    ctx->ledBrightnessApplied = -1;
+
+    if (view == 2) { // stopped -> put the user's own lighting back
+        restoreLedConfig(ctx);
+        return;
+    }
+
+    // A green (active scan) or red (channel hopping) sonar sweep.
+    np::setActiveColorMode(np::ColorMode::Static);
+    if (view == 0) np::setActiveColor(0, 200, 0);
+    else np::setActiveColor(220, 0, 0);
+    np::setActiveSpeed(12);
+    np::setActiveBrightness(40);
+    np::setActiveAnimation(np::Animation::Scanner);
+}
+
 // ---- Forward declarations ----
 
 void showPage(Context* ctx, Page page);
@@ -618,6 +722,8 @@ void setMode(Context* ctx, RadioMode mode) {
         if (ctx->statusLabel != nullptr) lv_label_set_text(ctx->statusLabel, "Capture stopped");
         lvgl_unlock();
     }
+
+    updateLeds(ctx);
 }
 
 void onStartScan(lv_event_t* event) {
@@ -982,6 +1088,8 @@ void showPage(Context* ctx, Page page) {
 
     // The physical back key steps one level instead of closing the app, except on the top page.
     lvgl_toolbar_set_back_override(page == Page::Graph ? nullptr : onHardwareBack, ctx);
+
+    updateLeds(ctx); // entering/leaving the detail switches the strip to/from the per-network colour
 }
 
 void goBack(Context* ctx) {
@@ -1090,6 +1198,8 @@ void updateViews(Context* ctx) {
     else if (page == Page::Detail) updateDetail(ctx);
     else if (page == Page::Clients) updateClientsPage(ctx);
     lvgl_unlock();
+
+    updateLeds(ctx); // keep the strip in step (e.g. detail brightness as the signal changes)
 }
 
 void onTimer(Context* ctx) {
@@ -1380,6 +1490,9 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
     // Auto-connect scans would compete with this app's own scans and with capture.
     service::wifi::setAutoScanPaused(true);
 
+    // Remember the strip's current look so we can hand it back untouched when the app exits.
+    saveLedConfig(&ctx);
+
     ctx.timer = std::make_unique<Timer>(Timer::Type::Periodic, REFRESH_MS, [&ctx] {
         onTimer(&ctx);
     });
@@ -1401,6 +1514,7 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
     stopTimer(&ctx);
     stopCapture(&ctx);
     service::wifi::setAutoScanPaused(false);
+    restoreLedConfig(&ctx); // give the strip back exactly as we found it
 
     window_manager_remove(ctx.window);
     check(app_event_unsubscribe(&sub) == ERROR_NONE);
