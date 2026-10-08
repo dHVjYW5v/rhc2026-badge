@@ -446,7 +446,7 @@ void connectTo(Context* ctx, const std::string& ssid) {
 }
 
 /** Fills one bell-curve series centered on the given channel/RSSI. */
-void fillBell(lv_chart_t* chart, lv_chart_series_t* series, int channel, int8_t rssi) {
+void fillBell(lv_obj_t* chart, lv_chart_series_t* series, int channel, int8_t rssi) {
     int32_t values[CHART_POINTS];
     int32_t height = std::clamp<int32_t>(rssi - SIGNAL_FLOOR_DBM, 1, SIGNAL_RANGE_DB);
     for (int i = 0; i < CHART_POINTS; i++) {
@@ -604,7 +604,7 @@ lv_obj_t* createListRow(Context* ctx, uint64_t key) {
     lv_obj_remove_flag(chip, LV_OBJ_FLAG_SCROLLABLE);
 
     auto* label = lv_label_create(row);
-    lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOT);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_flex_grow(label, 1);
 
     return row;
@@ -980,7 +980,8 @@ void createGraphPage(Context* ctx, lv_obj_t* parent) {
     lv_obj_set_style_pad_all(ctx->labelLayer, 0, 0);
     lv_obj_set_style_bg_opa(ctx->labelLayer, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(ctx->labelLayer, 0, 0);
-    lv_obj_remove_flag(ctx->labelLayer, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(ctx->labelLayer, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(ctx->labelLayer, LV_OBJ_FLAG_CLICKABLE);
 
     createAxisLabels(ctx->graphPage);
 }
