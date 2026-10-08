@@ -57,7 +57,7 @@ constexpr float CH_AXIS_MIN = 0.0f;
 constexpr float CH_AXIS_MAX = 14.0f;
 constexpr int32_t SIGNAL_FLOOR_DBM = -100;
 constexpr int32_t SIGNAL_RANGE_DB = 70;
-constexpr uint32_t HOP_INTERVAL_MS = 400;
+constexpr uint32_t HOP_INTERVAL_MS = 300;
 constexpr int MAX_PROBED_SSIDS = 4;
 
 /** Fraction 0..1 of the chart width where a channel's vertical line / bell peak sits. */
@@ -357,6 +357,12 @@ void onPromiscuousPacket(void* buf, wifi_promiscuous_pkt_type_t type) {
     }
 }
 
+// Kismet-style hop order: spread (consecutive hops land far apart in the band, not 1,2,3...) and
+// weighted so the three non-overlapping channels 1/6/11 - where most APs live - are visited twice
+// per cycle. This catches more without needing a faster (flickerier) hop than ~300 ms/channel.
+constexpr int HOP_SEQUENCE[] = {1, 6, 11, 3, 8, 13, 2, 7, 1, 6, 11, 4, 9, 5, 10, 12};
+constexpr int HOP_SEQUENCE_LEN = sizeof(HOP_SEQUENCE) / sizeof(HOP_SEQUENCE[0]);
+
 int32_t hopTask(void* /*arg*/) {
     esp_wifi_set_promiscuous_rx_cb(&onPromiscuousPacket);
     wifi_promiscuous_filter_t filter{};
@@ -364,12 +370,13 @@ int32_t hopTask(void* /*arg*/) {
     esp_wifi_set_promiscuous_filter(&filter);
     esp_wifi_set_promiscuous(true);
 
+    int i = 0;
     while (g_captureRunning.load()) {
-        for (int channel = 1; channel <= 13 && g_captureRunning.load(); channel++) {
-            esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-            g_hopChannel.store(channel);
-            vTaskDelay(pdMS_TO_TICKS(HOP_INTERVAL_MS));
-        }
+        int channel = HOP_SEQUENCE[i];
+        i = (i + 1) % HOP_SEQUENCE_LEN;
+        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+        g_hopChannel.store(channel);
+        vTaskDelay(pdMS_TO_TICKS(HOP_INTERVAL_MS));
     }
 
     esp_wifi_set_promiscuous(false);
@@ -640,10 +647,11 @@ void updateLeds(Context* ctx) {
         if (ctx->ledViewApplied != 3) {
             np::setVuPalette(np::VuPalette::Solid);
             np::setVuOrigin(np::VuOrigin::BothLeft);
-            np::setVuDecayEnabled(true);      // soft fade-down when the level drops
+            np::setVuDecayEnabled(true);      // bars shoot up and ease back down, like an equaliser
             np::setVuAutoGainEnabled(false);  // our mapping is already the full scale
             np::setVuBeatFlashEnabled(false);
-            np::setVuPeakHoldEnabled(false);
+            np::setVuPeakHoldEnabled(true);   // the bright peak dot that trails above the bar
+            np::setVuPeakBrightness(70);
             np::setVuSensitivity(100);        // show the whole range we feed
             np::setVuBrightness(ctx->savedBrightness != 0 ? ctx->savedBrightness : 60);
             np::setVuActive(true);
@@ -1315,9 +1323,20 @@ void stopTimer(Context* ctx) {
 // (a 1 Hz feed would let the meter drain to zero between pushes and flicker).
 void onLedTimer(Context* ctx) {
     if (!ctx->vuFeeding.load()) return;
-    uint8_t level = (uint8_t)ctx->vuLevel.load();
+    int base = ctx->vuLevel.load();
+
+    // Keep the bar alive: upward spikes around the proximity floor (never below it), so with decay
+    // on the bars shoot up and fall back like an equaliser. Livelier the closer the AP is.
+    uint32_t t = lv_tick_get();
+    float glow = sinf((float)(t % 1800) / 1800.0f * 6.2832f);
+    float ripple = sinf((float)(t % 320) / 320.0f * 6.2832f);
+    int amp = base * 22 / 100; // up to ~22% of the base, so far APs stay calm and near ones dance
+    int level = base + (int)(std::fabs(glow * 0.6f + ripple * 0.4f) * amp);
+    if (level < 0) level = 0;
+    if (level > 255) level = 255;
+
     service::neopixel::VuLevels levels{};
-    levels.left = levels.right = levels.bass = levels.mid = levels.treble = level;
+    levels.left = levels.right = levels.bass = levels.mid = levels.treble = (uint8_t)level;
     service::neopixel::setVuLevels(levels);
 }
 
