@@ -126,6 +126,7 @@ struct Context {
     std::unique_ptr<Timer> ledTimer = nullptr; // fast feed for the detail VU bar
     std::atomic<bool> vuFeeding{false};
     std::atomic<int> vuLevel{0};
+    std::atomic<uint32_t> vuRefreshTick{0}; // tick of the last fresh reading, for the breath swell
 
     Page page = Page::Graph;
     std::map<uint64_t, SeenAp> seen;
@@ -625,7 +626,8 @@ void updateLeds(Context* ctx) {
         return;
     }
 
-    if (page == Page::Detail) {
+    // The proximity bar is shown both in a network's detail and in its clients page.
+    if (page == Page::Detail || page == Page::Clients) {
         int colorIdx = 0;
         int8_t rssi = SIGNAL_FLOOR_DBM;
         bool found = false;
@@ -641,19 +643,18 @@ void updateLeds(Context* ctx) {
         if (!found) return;
 
         // Borrow the VU meter to draw a proximity bar: the strip fills up like an equaliser, in
-        // the network's colour, more LEDs lit the closer (stronger) the AP is. The bar is fed fast
-        // and continuously by ledTimer (so it never blinks), with decay on so it fades down softly
-        // when you move away and jumps up when you get closer.
+        // the network's colour, more LEDs lit the closer (stronger) the AP is. Fed fast and
+        // continuously by ledTimer (so it never blinks).
         if (ctx->ledViewApplied != 3) {
             np::setVuPalette(np::VuPalette::Solid);
             np::setVuOrigin(np::VuOrigin::BothLeft);
-            np::setVuDecayEnabled(true);      // bars shoot up and ease back down, like an equaliser
+            np::setVuDecayEnabled(true);      // the swell at each refresh eases back down
             np::setVuAutoGainEnabled(false);  // our mapping is already the full scale
             np::setVuBeatFlashEnabled(false);
-            np::setVuPeakHoldEnabled(true);   // the bright peak dot that trails above the bar
-            np::setVuPeakBrightness(70);
+            np::setVuPeakHoldEnabled(true);   // the bright peak dot that lingers at the recent max
+            np::setVuPeakBrightness(90);
             np::setVuSensitivity(100);        // show the whole range we feed
-            np::setVuBrightness(ctx->savedBrightness != 0 ? ctx->savedBrightness : 60);
+            np::setVuBrightness(ctx->savedBrightness != 0 ? ctx->savedBrightness : 70);
             np::setVuActive(true);
             ctx->vuFeeding.store(true);
             ctx->ledViewApplied = 3;
@@ -664,13 +665,16 @@ void updateLeds(Context* ctx) {
             np::setVuColor((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
             ctx->ledColorApplied = colorIdx;
         }
-        // Map signal to bar height: far (floor) -> empty, near -> full. ledTimer feeds this value.
+        // Map signal to bar length: far (floor) -> empty, near -> full. ledTimer feeds this value
+        // and adds a short "breath" swell at each refresh (vuRefreshTick marks when a fresh reading
+        // arrived). The peak dot then lingers at the swell's top, so you see if it was closer before.
         int32_t peak = std::clamp<int32_t>(rssi - SIGNAL_FLOOR_DBM, 0, SIGNAL_RANGE_DB);
         ctx->vuLevel.store((int)(peak * 255 / SIGNAL_RANGE_DB));
+        ctx->vuRefreshTick.store((uint32_t)lv_tick_get());
         return;
     }
 
-    // Leaving the detail: stop feeding and hand the meter back before drawing the mode animation.
+    // Leaving the proximity view: stop feeding and hand the meter back before the mode animation.
     if (ctx->ledViewApplied == 3) {
         ctx->vuFeeding.store(false);
         np::setVuActive(false);
@@ -1322,26 +1326,22 @@ void stopTimer(Context* ctx) {
 // Fast feed for the detail VU bar: pushing the current level continuously keeps the bar steady
 // (a 1 Hz feed would let the meter drain to zero between pushes and flicker).
 void onLedTimer(Context* ctx) {
-    namespace np = service::neopixel;
     if (!ctx->vuFeeding.load()) return;
     int base = ctx->vuLevel.load();
-    uint32_t t = lv_tick_get();
 
-    // The bar LENGTH stays equal to the proximity (truthful distance), with only a tiny ripple at
-    // the tip so it looks alive. The liveliness/"glow" is a breathing BRIGHTNESS pulse instead - the
-    // strip is horizontal, so nothing moves vertically; the lit length just glows.
-    float tip = sinf((float)(t % 700) / 700.0f * 6.2832f);
-    int level = base + (int)(tip * base * 0.05f);
+    // "Breath": at each fresh reading the bar swells above the real length, then (with decay on)
+    // eases back to it over ~600 ms, and the peak dot lingers at the swell's top. This is done on
+    // the LENGTH, via setVuLevels, because that always renders (a brightness pulse did not show on
+    // this VU). The strip is horizontal, so the swell runs along it - nothing moves vertically.
+    uint32_t sinceRefresh = (uint32_t)lv_tick_get() - ctx->vuRefreshTick.load();
+    float swell = sinceRefresh < 600 ? 0.40f * (1.0f - (float)sinceRefresh / 600.0f) : 0.0f;
+    int level = base + (int)(base * swell);
     if (level < 0) level = 0;
     if (level > 255) level = 255;
 
-    int baseBright = ctx->savedBrightness != 0 ? ctx->savedBrightness : 60;
-    float breath = 0.5f + 0.5f * sinf((float)(t % 1600) / 1600.0f * 6.2832f); // 0..1
-    np::setVuBrightness((uint8_t)(baseBright * (0.6f + 0.4f * breath)));       // 60%..100%
-
-    np::VuLevels levels{};
+    service::neopixel::VuLevels levels{};
     levels.left = levels.right = levels.bass = levels.mid = levels.treble = (uint8_t)level;
-    np::setVuLevels(levels);
+    service::neopixel::setVuLevels(levels);
 }
 
 // ---- Widget construction ----
