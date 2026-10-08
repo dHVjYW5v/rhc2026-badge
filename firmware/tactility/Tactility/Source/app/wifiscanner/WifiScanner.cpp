@@ -704,8 +704,8 @@ void updateRows(Context* ctx, const std::vector<SeenAp>& aps, const std::map<uin
         lv_label_set_text(label, ssidLine);
 
         auto* stats = lv_obj_get_child(row, 2);
-        char channelText[8];
-        char powerText[12];
+        char channelText[16];
+        char powerText[20];
         snprintf(channelText, sizeof(channelText), "ch%d", (int)ap.record.channel);
         snprintf(powerText, sizeof(powerText), "%d dBm", (int)ap.record.rssi);
         lv_label_set_text(lv_obj_get_child(stats, 0), channelText);
@@ -714,7 +714,7 @@ void updateRows(Context* ctx, const std::vector<SeenAp>& aps, const std::map<uin
 
         auto countIt = clientCounts.find(key);
         int count = countIt != clientCounts.end() ? countIt->second : 0;
-        char clientText[12] = "";
+        char clientText[20] = "";
         if (count > 0) snprintf(clientText, sizeof(clientText), "cli:%d", count);
         lv_label_set_text(lv_obj_get_child(stats, 3), clientText);
     }
