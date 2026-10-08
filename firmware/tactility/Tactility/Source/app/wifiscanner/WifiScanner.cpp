@@ -113,6 +113,8 @@ struct CapturedClient {
     uint64_t associatedBssid = 0;
     std::vector<std::string> probedSsids;
     uint32_t packetCount = 0;
+    uint32_t txCount = 0; // data frames the client sent (to the AP)
+    uint32_t rxCount = 0; // data frames the client received (from the AP)
 };
 
 struct Context {
@@ -121,6 +123,9 @@ struct Context {
 
     RecursiveMutex mutex;
     std::unique_ptr<Timer> timer = nullptr;
+    std::unique_ptr<Timer> ledTimer = nullptr; // fast feed for the detail VU bar
+    std::atomic<bool> vuFeeding{false};
+    std::atomic<int> vuLevel{0};
 
     Page page = Page::Graph;
     std::map<uint64_t, SeenAp> seen;
@@ -290,7 +295,7 @@ void upsertClientProbe(Context* ctx, const uint8_t* mac, const std::string& prob
     ctx->mutex.unlock();
 }
 
-void upsertClientAssociation(Context* ctx, const uint8_t* mac, const uint8_t* bssid, int8_t rssi) {
+void upsertClientAssociation(Context* ctx, const uint8_t* mac, const uint8_t* bssid, int8_t rssi, bool clientSent) {
     if (!ctx->mutex.lock(0)) return;
     uint64_t key = bssidKey(mac);
     uint64_t now = nowMs();
@@ -303,6 +308,7 @@ void upsertClientAssociation(Context* ctx, const uint8_t* mac, const uint8_t* bs
     client.lastRssi = rssi;
     client.associatedBssid = bssidKey(bssid);
     client.packetCount++;
+    if (clientSent) client.txCount++; else client.rxCount++;
     ctx->mutex.unlock();
 }
 
@@ -342,9 +348,11 @@ void onPromiscuousPacket(void* buf, wifi_promiscuous_pkt_type_t type) {
         }
     } else if (frameType == 2) { // data
         if (toDs && !fromDs) {
-            upsertClientAssociation(ctx, addr2, addr1, rssi); // addr1=BSSID, addr2=client
+            // client -> AP: the client is the sender (addr2), AP is addr1
+            upsertClientAssociation(ctx, addr2, addr1, rssi, true);
         } else if (!toDs && fromDs) {
-            upsertClientAssociation(ctx, addr1, addr2, rssi); // addr1=client, addr2=BSSID
+            // AP -> client: the client is the receiver (addr1), AP is addr2
+            upsertClientAssociation(ctx, addr1, addr2, rssi, false);
         }
     }
 }
@@ -624,17 +632,20 @@ void updateLeds(Context* ctx) {
         if (!found) return;
 
         // Borrow the VU meter to draw a proximity bar: the strip fills up like an equaliser, in
-        // the network's colour, more LEDs lit the closer (stronger) the AP is.
+        // the network's colour, more LEDs lit the closer (stronger) the AP is. The bar is fed fast
+        // and continuously by ledTimer (so it never blinks), with decay on so it fades down softly
+        // when you move away and jumps up when you get closer.
         if (ctx->ledViewApplied != 3) {
             np::setVuPalette(np::VuPalette::Solid);
             np::setVuOrigin(np::VuOrigin::BothLeft);
-            np::setVuDecayEnabled(false);     // follow the level exactly, no bouncing
+            np::setVuDecayEnabled(true);      // soft fade-down when the level drops
             np::setVuAutoGainEnabled(false);  // our mapping is already the full scale
             np::setVuBeatFlashEnabled(false);
             np::setVuPeakHoldEnabled(false);
             np::setVuSensitivity(100);        // show the whole range we feed
             np::setVuBrightness(ctx->savedBrightness != 0 ? ctx->savedBrightness : 60);
             np::setVuActive(true);
+            ctx->vuFeeding.store(true);
             ctx->ledViewApplied = 3;
             ctx->ledColorApplied = -1;
         }
@@ -643,17 +654,17 @@ void updateLeds(Context* ctx) {
             np::setVuColor((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
             ctx->ledColorApplied = colorIdx;
         }
-        // Map signal to bar height: far (floor) -> empty, near -> full.
+        // Map signal to bar height: far (floor) -> empty, near -> full. ledTimer feeds this value.
         int32_t peak = std::clamp<int32_t>(rssi - SIGNAL_FLOOR_DBM, 0, SIGNAL_RANGE_DB);
-        uint8_t level = (uint8_t)(peak * 255 / SIGNAL_RANGE_DB);
-        service::neopixel::VuLevels levels{};
-        levels.left = levels.right = levels.bass = levels.mid = levels.treble = level;
-        np::setVuLevels(levels);
+        ctx->vuLevel.store((int)(peak * 255 / SIGNAL_RANGE_DB));
         return;
     }
 
-    // Leaving the detail: hand the meter back before drawing the mode animation.
-    if (ctx->ledViewApplied == 3) np::setVuActive(false);
+    // Leaving the detail: stop feeding and hand the meter back before drawing the mode animation.
+    if (ctx->ledViewApplied == 3) {
+        ctx->vuFeeding.store(false);
+        np::setVuActive(false);
+    }
 
     // Graph / list: the strip reflects the capture state.
     int view = mode == RadioMode::Capture ? 1 : (mode == RadioMode::ActiveScan ? 0 : 2);
@@ -1005,32 +1016,35 @@ void updateDetail(Context* ctx) {
 
 // ---- Clients page (all devices seen by the passive capture, Kismet-style) ----
 
-constexpr int CLIENT_ROW_HEIGHT = 40;
+constexpr int CLIENT_ROW_HEIGHT = 30;
+constexpr int COL_CDBM = 46;
+constexpr int COL_TX = 46;
+constexpr int COL_RX = 46;
 
+/** Same row shape as the networks list: [MAC (scrolls if long)][dBm][TX][RX]. */
 lv_obj_t* createClientRow(Context* ctx) {
-    // lv_list button so the row joins the keypad group and the list scrolls with up/down.
     auto* row = lv_list_add_button(ctx->clientsList, nullptr, "");
     lv_obj_clean(row);
     lv_obj_set_height(row, CLIENT_ROW_HEIGHT);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_all(row, 2, 0);
+    lv_obj_set_style_pad_column(row, 4, 0);
 
-    auto* macLabel = lv_label_create(row);
-    lv_label_set_long_mode(macLabel, LV_LABEL_LONG_MODE_DOTS);
-    lv_obj_set_width(macLabel, LV_PCT(100));
+    auto* mac = lv_label_create(row);
+    lv_label_set_long_mode(mac, LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);
+    lv_obj_set_flex_grow(mac, 1);
 
-    auto* infoLabel = lv_label_create(row);
-    lv_label_set_long_mode(infoLabel, LV_LABEL_LONG_MODE_DOTS);
-    lv_obj_set_width(infoLabel, LV_PCT(100));
-    lv_obj_set_style_text_color(infoLabel, lv_color_hex(0x808080), 0);
-
+    addFieldLabel(row, COL_CDBM); // child 1: dBm
+    addFieldLabel(row, COL_TX);   // child 2: TX
+    addFieldLabel(row, COL_RX);   // child 3: RX
     return row;
 }
 
 void updateClientsPage(Context* ctx) {
     if (ctx->clientsList == nullptr) return;
 
-    struct Row { uint64_t key; uint32_t frames; std::string mac; std::string info; };
+    struct Row { uint64_t key; uint32_t frames; std::string mac; int rssi; uint32_t tx; uint32_t rx; };
     std::vector<Row> clientRows2;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
         uint64_t selected = ctx->selectedKey;
@@ -1046,25 +1060,17 @@ void updateClientsPage(Context* ctx) {
 
             bool randomMac = (client.mac[0] & 0x02) != 0;
             const char* vendor = randomMac ? nullptr : lookupVendor(client.mac);
-            std::string probes;
-            for (const auto& ssid : client.probedSsids) {
-                if (!probes.empty()) probes += ", ";
-                probes += ssid;
-            }
-
-            std::string mac = macToString(client.mac) + (randomMac ? " (MAC casuale)" : "");
+            std::string mac = macToString(client.mac) + (randomMac ? " (casuale)" : "");
             if (vendor != nullptr) mac += std::string(" - ") + vendor;
-            std::string info = std::to_string(client.lastRssi) + " dBm, " +
-                std::to_string(client.packetCount) + " frame" +
-                (probes.empty() ? "" : " | sonda: " + probes);
 
-            clientRows2.push_back({it->first, client.packetCount, mac, info});
+            clientRows2.push_back({it->first, client.packetCount, mac, client.lastRssi, client.txCount, client.rxCount});
             ++it;
         }
         ctx->mutex.unlock();
     }
 
-    // Most active client (most frames) first.
+    // Most active client (most frames) first. This decides the order only for rows being created;
+    // existing rows keep their place so scrolling doesn't jump (see the no-reorder note below).
     std::sort(clientRows2.begin(), clientRows2.end(), [](const Row& a, const Row& b) { return a.frames > b.frames; });
 
     std::vector<uint64_t> keys;
@@ -1081,17 +1087,21 @@ void updateClientsPage(Context* ctx) {
         lv_obj_t* widget;
         auto it = ctx->clientRows.find(row.key);
         if (it == ctx->clientRows.end()) {
-            widget = createClientRow(ctx);
+            widget = createClientRow(ctx); // appended at the end; order is set fresh on page open
             ctx->clientRows[row.key] = widget;
         } else {
             widget = it->second;
         }
+        char dbm[12], tx[12], rx[12];
+        snprintf(dbm, sizeof(dbm), "%d", row.rssi);
+        snprintf(tx, sizeof(tx), "%u", (unsigned)row.tx);
+        snprintf(rx, sizeof(rx), "%u", (unsigned)row.rx);
         lv_label_set_text(lv_obj_get_child(widget, 0), row.mac.c_str());
-        lv_label_set_text(lv_obj_get_child(widget, 1), row.info.c_str());
+        lv_label_set_text(lv_obj_get_child(widget, 1), dbm);
+        lv_label_set_text(lv_obj_get_child(widget, 2), tx);
+        lv_label_set_text(lv_obj_get_child(widget, 3), rx);
     }
-    for (size_t i = 0; i < keys.size(); i++) {
-        lv_obj_move_to_index(ctx->clientRows[keys[i]], (int32_t)i);
-    }
+    // No move_to_index: existing rows stay put (stable scrolling); new ones append at the end.
 }
 
 // ---- Page switching / toolbar back handling ----
@@ -1135,8 +1145,12 @@ void showPage(Context* ctx, Page page) {
         case Page::Clients:
             lv_obj_remove_flag(ctx->clientsPage, LV_OBJ_FLAG_HIDDEN);
             setTitle(ctx, "Client della rete");
-            if (ctx->clientsList != nullptr) lv_obj_scroll_to_y(ctx->clientsList, 0, LV_ANIM_OFF);
+            // Rebuild from scratch so the order is freshly sorted by activity each time it opens
+            // (it then stays stable while you scroll).
+            for (auto& [k, w] : ctx->clientRows) lv_obj_delete(w);
+            ctx->clientRows.clear();
             updateClientsPage(ctx);
+            if (ctx->clientsList != nullptr) lv_obj_scroll_to_y(ctx->clientsList, 0, LV_ANIM_OFF);
             break;
     }
 
@@ -1282,11 +1296,24 @@ void onTimer(Context* ctx) {
 
 void stopTimer(Context* ctx) {
     std::unique_ptr<Timer> timer;
+    std::unique_ptr<Timer> ledTimer;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
         timer = std::move(ctx->timer);
+        ledTimer = std::move(ctx->ledTimer);
         ctx->mutex.unlock();
     }
     if (timer) timer->stop();
+    if (ledTimer) ledTimer->stop();
+}
+
+// Fast feed for the detail VU bar: pushing the current level continuously keeps the bar steady
+// (a 1 Hz feed would let the meter drain to zero between pushes and flicker).
+void onLedTimer(Context* ctx) {
+    if (!ctx->vuFeeding.load()) return;
+    uint8_t level = (uint8_t)ctx->vuLevel.load();
+    service::neopixel::VuLevels levels{};
+    levels.left = levels.right = levels.bass = levels.mid = levels.treble = level;
+    service::neopixel::setVuLevels(levels);
 }
 
 // ---- Widget construction ----
@@ -1497,8 +1524,26 @@ void createClientsPage(Context* ctx, lv_obj_t* parent) {
     ctx->clientsPage = createPage(parent);
     lv_obj_add_flag(ctx->clientsPage, LV_OBJ_FLAG_HIDDEN);
 
+    // Legend header lined up with the client row columns.
+    auto* header = lv_obj_create(ctx->clientsPage);
+    lv_obj_set_size(header, LV_PCT(100), 18);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(header, 2, 0);
+    lv_obj_set_style_pad_column(header, 4, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_remove_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    auto* macHdr = lv_label_create(header);
+    lv_label_set_text(macHdr, "Client (MAC)");
+    lv_obj_set_flex_grow(macHdr, 1);
+    addLegendLabel(header, "dBm", COL_CDBM);
+    addLegendLabel(header, "TX", COL_TX);
+    addLegendLabel(header, "RX", COL_RX);
+
     ctx->clientsList = lv_list_create(ctx->clientsPage);
-    lv_obj_set_size(ctx->clientsList, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_width(ctx->clientsList, LV_PCT(100));
+    lv_obj_set_flex_grow(ctx->clientsList, 1);
+    lv_obj_set_style_pad_all(ctx->clientsList, 0, 0);
     lv_obj_set_style_pad_row(ctx->clientsList, 2, 0);
 }
 
@@ -1574,6 +1619,11 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
         onTimer(&ctx);
     });
     ctx.timer->start();
+
+    ctx.ledTimer = std::make_unique<Timer>(Timer::Type::Periodic, 50, [&ctx] {
+        onLedTimer(&ctx);
+    });
+    ctx.ledTimer->start();
 
     bool shouldClose = false;
     while (!shouldClose) {
