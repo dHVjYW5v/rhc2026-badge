@@ -138,8 +138,9 @@ struct Context {
     std::map<uint64_t, lv_obj_t*> rows;
 
     lv_obj_t* detailPage = nullptr;
+    lv_obj_t* detailScroll = nullptr;
     lv_obj_t* detailInfo = nullptr;
-    lv_obj_t* detailClients = nullptr;
+    lv_obj_t* detailClientsButton = nullptr;
     lv_obj_t* connectButton = nullptr;
 
     lv_obj_t* clientsPage = nullptr;
@@ -882,7 +883,7 @@ void updateDetail(Context* ctx) {
     SeenAp ap{};
     bool found = false;
     uint32_t beaconBaseline = 0;
-    std::vector<CapturedClient> relatedClients;
+    int clientCount = 0;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
         auto it = ctx->seen.find(ctx->selectedKey);
         if (it != ctx->seen.end()) {
@@ -890,7 +891,7 @@ void updateDetail(Context* ctx) {
             found = true;
             beaconBaseline = ctx->detailBeaconBaseline;
             for (const auto& [clientKey, client] : ctx->clients) {
-                if (client.associatedBssid == ctx->selectedKey) relatedClients.push_back(client);
+                if (client.associatedBssid == ctx->selectedKey) clientCount++;
             }
         }
         ctx->mutex.unlock();
@@ -936,22 +937,12 @@ void updateDetail(Context* ctx) {
     }
     lv_label_set_text(ctx->detailInfo, text);
 
-    if (ctx->detailClients != nullptr) {
-        if (relatedClients.empty()) {
-            lv_label_set_text(ctx->detailClients, "Client associati: nessuno rilevato dalla cattura.");
-        } else {
-            // Most active client (most frames/beacons) first.
-            std::sort(relatedClients.begin(), relatedClients.end(),
-                [](const CapturedClient& a, const CapturedClient& b) { return a.packetCount > b.packetCount; });
-            std::string clientText = "Client associati (cattura passiva):\n";
-            for (const auto& client : relatedClients) {
-                bool randomMac = (client.mac[0] & 0x02) != 0;
-                clientText += "- " + macToString(client.mac) + (randomMac ? " (MAC casuale)" : "") +
-                    ", " + std::to_string(client.lastRssi) + " dBm, " +
-                    std::to_string(client.packetCount) + " frame\n";
-            }
-            lv_label_set_text(ctx->detailClients, clientText.c_str());
-        }
+    // Clients live on their own page now; the button just shows how many and opens it.
+    if (ctx->detailClientsButton != nullptr) {
+        char buttonText[32];
+        snprintf(buttonText, sizeof(buttonText), "Client associati (%d)", clientCount);
+        lv_obj_t* label = lv_obj_get_child(ctx->detailClientsButton, lv_obj_get_child_count(ctx->detailClientsButton) - 1);
+        if (label != nullptr) lv_label_set_text(label, buttonText);
     }
 }
 
@@ -982,9 +973,10 @@ lv_obj_t* createClientRow(Context* ctx) {
 void updateClientsPage(Context* ctx) {
     if (ctx->clientsList == nullptr) return;
 
-    struct Row { uint64_t key; std::string mac; std::string info; };
+    struct Row { uint64_t key; uint32_t frames; std::string mac; std::string info; };
     std::vector<Row> clientRows2;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
+        uint64_t selected = ctx->selectedKey;
         uint64_t now = nowMs();
         for (auto it = ctx->clients.begin(); it != ctx->clients.end();) {
             if (now - it->second.lastSeenMs > ROW_EXPIRY_MS) {
@@ -992,14 +984,11 @@ void updateClientsPage(Context* ctx) {
                 continue;
             }
             const auto& client = it->second;
+            // Only the clients associated to the network whose detail we came from.
+            if (client.associatedBssid != selected) { ++it; continue; }
+
             bool randomMac = (client.mac[0] & 0x02) != 0;
             const char* vendor = randomMac ? nullptr : lookupVendor(client.mac);
-
-            std::string assoc = "non associato";
-            if (client.associatedBssid != 0) {
-                auto apIt = ctx->seen.find(client.associatedBssid);
-                assoc = "assoc: " + std::string(apIt != ctx->seen.end() ? displaySsid(apIt->second.record) : "?");
-            }
             std::string probes;
             for (const auto& ssid : client.probedSsids) {
                 if (!probes.empty()) probes += ", ";
@@ -1008,16 +997,18 @@ void updateClientsPage(Context* ctx) {
 
             std::string mac = macToString(client.mac) + (randomMac ? " (MAC casuale)" : "");
             if (vendor != nullptr) mac += std::string(" - ") + vendor;
-            std::string info = assoc + (probes.empty() ? "" : " | sonda: " + probes) +
-                " | " + std::to_string(client.lastRssi) + " dBm";
+            std::string info = std::to_string(client.lastRssi) + " dBm, " +
+                std::to_string(client.packetCount) + " frame" +
+                (probes.empty() ? "" : " | sonda: " + probes);
 
-            clientRows2.push_back({it->first, mac, info});
+            clientRows2.push_back({it->first, client.packetCount, mac, info});
             ++it;
         }
         ctx->mutex.unlock();
     }
 
-    std::sort(clientRows2.begin(), clientRows2.end(), [](const Row& a, const Row& b) { return a.key < b.key; });
+    // Most active client (most frames) first.
+    std::sort(clientRows2.begin(), clientRows2.end(), [](const Row& a, const Row& b) { return a.frames > b.frames; });
 
     std::vector<uint64_t> keys;
     for (const auto& row : clientRows2) keys.push_back(row.key);
@@ -1077,11 +1068,17 @@ void showPage(Context* ctx, Page page) {
         case Page::Detail:
             lv_obj_remove_flag(ctx->detailPage, LV_OBJ_FLAG_HIDDEN);
             setTitle(ctx, "Dettaglio rete");
+            // Re-entering always starts from the top, not where the previous visit was left.
+            if (ctx->detailScroll != nullptr) lv_obj_scroll_to_y(ctx->detailScroll, 0, LV_ANIM_OFF);
+            if (ctx->detailClientsButton != nullptr && lv_obj_get_group(ctx->detailClientsButton) != nullptr) {
+                lv_group_focus_obj(ctx->detailClientsButton);
+            }
             updateDetail(ctx);
             break;
         case Page::Clients:
             lv_obj_remove_flag(ctx->clientsPage, LV_OBJ_FLAG_HIDDEN);
-            setTitle(ctx, "Client rilevati");
+            setTitle(ctx, "Client della rete");
+            if (ctx->clientsList != nullptr) lv_obj_scroll_to_y(ctx->clientsList, 0, LV_ANIM_OFF);
             updateClientsPage(ctx);
             break;
     }
@@ -1102,7 +1099,7 @@ void goBack(Context* ctx) {
     }
     if (current == Page::Detail) showPage(ctx, Page::List);
     else if (current == Page::List) showPage(ctx, Page::Graph);
-    else if (current == Page::Clients) showPage(ctx, Page::Graph);
+    else if (current == Page::Clients) showPage(ctx, Page::Detail); // clients opened from a network's detail
 }
 
 void onShowClients(lv_event_t* event) {
@@ -1391,6 +1388,9 @@ void createListPage(Context* ctx, lv_obj_t* parent) {
     ctx->list = lv_list_create(ctx->listPage);
     lv_obj_set_width(ctx->list, LV_PCT(100));
     lv_obj_set_flex_grow(ctx->list, 1);
+    // Zero the list's own horizontal padding so each row starts at the same x as the header above
+    // (the row's own 2px padding then matches the header's), keeping the columns lined up.
+    lv_obj_set_style_pad_all(ctx->list, 0, 0);
     lv_obj_set_style_pad_row(ctx->list, 2, 0);
 }
 
@@ -1399,19 +1399,20 @@ void createDetailPage(Context* ctx, lv_obj_t* parent) {
     lv_obj_add_flag(ctx->detailPage, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_style_pad_all(ctx->detailPage, 4, 0);
 
-    // The text and the Connect button live in an lv_list so the page scrolls with the badge keys
-    // (focusing the Connect button at the bottom drags the list up to reveal everything).
+    // Everything lives in an lv_list so it scrolls with the badge keys. Two focusable buttons -
+    // "Client" at the top and "Connetti" at the bottom - give an up target and a down target, so
+    // the arrows scroll the page both ways (with a single button you could only go down).
     auto* scroll = lv_list_create(ctx->detailPage);
     lv_obj_set_width(scroll, LV_PCT(100));
     lv_obj_set_flex_grow(scroll, 1);
+    ctx->detailScroll = scroll;
+
+    ctx->detailClientsButton = lv_list_add_button(scroll, LV_SYMBOL_LIST, "Client associati (0)");
+    lv_obj_add_event_cb(ctx->detailClientsButton, onShowClients, LV_EVENT_CLICKED, ctx);
 
     ctx->detailInfo = lv_label_create(scroll);
     lv_label_set_long_mode(ctx->detailInfo, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_width(ctx->detailInfo, LV_PCT(100));
-
-    ctx->detailClients = lv_label_create(scroll);
-    lv_label_set_long_mode(ctx->detailClients, LV_LABEL_LONG_MODE_WRAP);
-    lv_obj_set_width(ctx->detailClients, LV_PCT(100));
 
     ctx->connectButton = lv_list_add_button(scroll, LV_SYMBOL_WIFI, "Connetti");
     lv_obj_add_event_cb(ctx->connectButton, onConnectPressed, LV_EVENT_CLICKED, ctx);
@@ -1465,8 +1466,9 @@ void destroyWidgets(void* userData) {
     ctx->list = nullptr;
     ctx->rows.clear();
     ctx->detailPage = nullptr;
+    ctx->detailScroll = nullptr;
     ctx->detailInfo = nullptr;
-    ctx->detailClients = nullptr;
+    ctx->detailClientsButton = nullptr;
     ctx->connectButton = nullptr;
     ctx->clientsPage = nullptr;
     ctx->clientsList = nullptr;
