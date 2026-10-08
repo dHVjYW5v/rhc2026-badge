@@ -517,9 +517,7 @@ void updateGraph(Context* ctx, const std::vector<SeenAp>& aps) {
     if (ctx->chart == nullptr) return;
 
     lv_obj_clean(ctx->labelLayer);
-
-    struct Placed { int x; int width; };
-    std::vector<Placed> placed;
+    int chartWidth = lv_obj_get_width(ctx->chart);
 
     int used = 0;
     for (const auto& ap : aps) {
@@ -529,24 +527,20 @@ void updateGraph(Context* ctx, const std::vector<SeenAp>& aps) {
         fillBell(ctx->chart, ctx->series[used], ap.record.channel, ap.record.rssi);
         lv_chart_hide_series(ctx->chart, ctx->series[used], false);
 
+        // The name sits centered on its own bell's peak. A channel's peak is at (channel+1)/16
+        // of the plot width - the same fraction createAxisLabels uses for the channel numbers,
+        // so the name lines up over its bell. Names on nearby channels may overlap: that's
+        // accepted, keeping each name on its own curve as before.
         auto* label = lv_label_create(ctx->labelLayer);
         lv_label_set_text(label, displaySsid(ap.record));
         lv_obj_set_style_text_color(label, lv_color_hex(SERIES_COLORS[used]), 0);
         lv_obj_update_layout(label);
         int width = lv_obj_get_width(label);
-        // Peak sits at (channel+1)/16 of the chart's width (see createAxisLabels - same formula
-        // as the axis numbers, so a bell lines up under its own channel label); nudge left/right
-        // to avoid overlapping a previously placed label at a nearby channel.
-        int chartWidth = lv_obj_get_width(ctx->chart);
         int xPx = chartWidth * (ap.record.channel + 1) / 16 - width / 2;
-        for (const auto& other : placed) {
-            if (xPx < other.x + other.width + 2 && xPx + width + 2 > other.x) {
-                xPx = other.x + other.width + 2;
-            }
-        }
+        if (xPx < 0) xPx = 0;
+        if (xPx + width > chartWidth) xPx = chartWidth - width;
         lv_obj_set_x(label, xPx);
-        lv_obj_set_y(label, 2);
-        placed.push_back({xPx, width});
+        lv_obj_set_y(label, 2 + (used % 3) * 16); // stagger a little vertically so overlaps stay readable
         used++;
     }
     for (int i = used; i < MAX_SERIES; i++) {
@@ -595,6 +589,14 @@ void setMode(Context* ctx, RadioMode mode) {
     if (previous == RadioMode::Capture && mode != RadioMode::Capture) stopCapture(ctx);
     if (mode == RadioMode::Capture) startCapture(ctx);
     refreshModeButtons(ctx);
+
+    // Stopped freezes the views (updateViews returns early), so set the status text here;
+    // nothing else will.
+    if (mode == RadioMode::Stopped) {
+        lvgl_lock();
+        if (ctx->statusLabel != nullptr) lv_label_set_text(ctx->statusLabel, "FERMO (dati congelati)");
+        lvgl_unlock();
+    }
 }
 
 void onStartScan(lv_event_t* event) {
@@ -623,46 +625,40 @@ void onSelectFromList(lv_event_t* event) {
     showPage(ctx, Page::Detail);
 }
 
-constexpr int LIST_ROW_HEIGHT = 68;
-constexpr int LIST_STATS_WIDTH = 74;
+constexpr int LIST_ROW_HEIGHT = 64;
+constexpr int LIST_STATS_WIDTH = 86;
 
+/** A row is an lv_list button (so the hardware up/down keys can focus it and scroll the list),
+ * laid out as: thin colour bar | SSID (scrolls if long) | ch/power/security/clients stacked.
+ * The sub-objects carry no border/background of their own, so there are no visible nested boxes. */
 lv_obj_t* createListRow(Context* ctx, uint64_t key) {
-    auto* row = lv_obj_create(ctx->list);
-    lv_obj_set_size(row, LV_PCT(100), LIST_ROW_HEIGHT);
+    auto* row = lv_list_add_button(ctx->list, nullptr, "");
+    lv_obj_clean(row); // drop the empty label lv_list_add_button created, we lay the row out ourselves
+    lv_obj_set_height(row, LIST_ROW_HEIGHT);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_all(row, 4, 0);
+    lv_obj_set_style_pad_all(row, 3, 0);
     lv_obj_set_style_pad_column(row, 6, 0);
-    lv_obj_set_style_border_width(row, 0, 0);
-    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE); // a scrollable row fights the list's own scroll
-    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_user_data(row, reinterpret_cast<void*>(key));
-    lv_obj_add_event_cb(row, onSelectFromList, LV_EVENT_SHORT_CLICKED, ctx);
+    lv_obj_add_event_cb(row, onSelectFromList, LV_EVENT_CLICKED, ctx);
 
+    // Colour bar for the security type, hard left.
     auto* chip = lv_obj_create(row);
-    lv_obj_set_size(chip, 5, LV_PCT(100));
+    lv_obj_set_size(chip, 6, LV_PCT(100));
     lv_obj_set_style_radius(chip, 2, 0);
     lv_obj_set_style_border_width(chip, 0, 0);
+    lv_obj_set_style_pad_all(chip, 0, 0);
     lv_obj_remove_flag(chip, LV_OBJ_FLAG_SCROLLABLE);
 
-    // The SSID scrolls like a bus sign when it's longer than the space left for it.
+    // SSID, takes all the middle space, scrolls like a bus sign when too long.
     auto* label = lv_label_create(row);
     lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);
     lv_obj_set_flex_grow(label, 1);
-    lv_obj_set_height(label, LV_SIZE_CONTENT);
-    lv_obj_align(label, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_style_align(label, LV_ALIGN_LEFT_MID, 0);
 
-    // Channel / power / security stacked, one under the other, in a fixed-width column on the right.
-    auto* stats = lv_obj_create(row);
-    lv_obj_set_size(stats, LIST_STATS_WIDTH, LV_PCT(100));
-    lv_obj_set_flex_flow(stats, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_all(stats, 0, 0);
-    lv_obj_set_style_border_width(stats, 0, 0);
-    lv_obj_remove_flag(stats, LV_OBJ_FLAG_SCROLLABLE);
-    for (int i = 0; i < 4; i++) {
-        auto* statLabel = lv_label_create(stats);
-        lv_obj_set_width(statLabel, LV_PCT(100));
-        lv_obj_set_style_text_align(statLabel, LV_TEXT_ALIGN_RIGHT, 0);
-    }
+    // One right-aligned multi-line label (not a boxed container): channel / power / security / clients.
+    auto* stats = lv_label_create(row);
+    lv_obj_set_width(stats, LIST_STATS_WIDTH);
+    lv_obj_set_style_text_align(stats, LV_TEXT_ALIGN_RIGHT, 0);
 
     return row;
 }
@@ -703,20 +699,17 @@ void updateRows(Context* ctx, const std::vector<SeenAp>& aps, const std::map<uin
         snprintf(ssidLine, sizeof(ssidLine), "%s%s", displaySsid(ap.record), ap.fromCapture ? " (cattura)" : "");
         lv_label_set_text(label, ssidLine);
 
-        auto* stats = lv_obj_get_child(row, 2);
-        char channelText[16];
-        char powerText[20];
-        snprintf(channelText, sizeof(channelText), "ch%d", (int)ap.record.channel);
-        snprintf(powerText, sizeof(powerText), "%d dBm", (int)ap.record.rssi);
-        lv_label_set_text(lv_obj_get_child(stats, 0), channelText);
-        lv_label_set_text(lv_obj_get_child(stats, 1), powerText);
-        lv_label_set_text(lv_obj_get_child(stats, 2), authToString(ap.record.authentication_type));
-
         auto countIt = clientCounts.find(key);
         int count = countIt != clientCounts.end() ? countIt->second : 0;
-        char clientText[20] = "";
-        if (count > 0) snprintf(clientText, sizeof(clientText), "cli:%d", count);
-        lv_label_set_text(lv_obj_get_child(stats, 3), clientText);
+        char stats[96];
+        if (count > 0) {
+            snprintf(stats, sizeof(stats), "ch%d\n%d dBm\n%s\ncli:%d", (int)ap.record.channel,
+                (int)ap.record.rssi, authToString(ap.record.authentication_type), count);
+        } else {
+            snprintf(stats, sizeof(stats), "ch%d\n%d dBm\n%s", (int)ap.record.channel,
+                (int)ap.record.rssi, authToString(ap.record.authentication_type));
+        }
+        lv_label_set_text(lv_obj_get_child(row, 2), stats);
     }
 
     // Re-order to match the sorted-by-RSSI list.
@@ -808,18 +801,20 @@ void updateDetail(Context* ctx) {
 constexpr int CLIENT_ROW_HEIGHT = 40;
 
 lv_obj_t* createClientRow(Context* ctx) {
-    auto* row = lv_obj_create(ctx->clientsList);
-    lv_obj_set_size(row, LV_PCT(100), CLIENT_ROW_HEIGHT);
+    // lv_list button so the row joins the keypad group and the list scrolls with up/down.
+    auto* row = lv_list_add_button(ctx->clientsList, nullptr, "");
+    lv_obj_clean(row);
+    lv_obj_set_height(row, CLIENT_ROW_HEIGHT);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(row, 2, 0);
-    lv_obj_set_style_border_width(row, 0, 0);
-    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
     auto* macLabel = lv_label_create(row);
     lv_label_set_long_mode(macLabel, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_width(macLabel, LV_PCT(100));
 
     auto* infoLabel = lv_label_create(row);
     lv_label_set_long_mode(infoLabel, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_width(infoLabel, LV_PCT(100));
     lv_obj_set_style_text_color(infoLabel, lv_color_hex(0x808080), 0);
 
     return row;
@@ -1105,9 +1100,10 @@ void createAxisLabels(lv_obj_t* parent) {
     }
 }
 
-lv_obj_t* createIconButton(lv_obj_t* parent, const char* icon, lv_event_cb_t callback, Context* ctx) {
+lv_obj_t* createIconButton(lv_obj_t* parent, const char* icon, lv_event_cb_t callback, Context* ctx, int size = 40) {
     auto* button = lv_button_create(parent);
-    lv_obj_set_size(button, 40, 40);
+    lv_obj_set_size(button, size, size);
+    lv_obj_set_style_pad_all(button, 0, 0);
     auto* label = lv_label_create(button);
     lv_label_set_text(label, icon);
     lv_obj_center(label);
@@ -1173,19 +1169,22 @@ void createGraphPage(Context* ctx, lv_obj_t* parent) {
     createAxisLabels(leftColumn);
 
     // Small icon buttons, stacked, pinned to the far right - like the old single list button.
+    constexpr int BTN = 36;
     auto* rightColumn = lv_obj_create(mainRow);
-    lv_obj_set_size(rightColumn, 40, LV_PCT(100));
+    lv_obj_set_size(rightColumn, BTN, LV_PCT(100));
     lv_obj_set_flex_flow(rightColumn, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(rightColumn, 0, 0);
-    lv_obj_set_style_pad_row(rightColumn, 4, 0);
+    lv_obj_set_style_pad_row(rightColumn, 3, 0);
     lv_obj_set_style_border_width(rightColumn, 0, 0);
     lv_obj_remove_flag(rightColumn, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Scansione attiva (come la vecchia app) / cattura passiva con salto canale / ferma tutto.
-    ctx->scanButton = createIconButton(rightColumn, LV_SYMBOL_REFRESH, onStartScan, ctx);
-    ctx->captureButton = createIconButton(rightColumn, LV_SYMBOL_EYE_OPEN, onStartCapture, ctx);
-    ctx->stopButton = createIconButton(rightColumn, LV_SYMBOL_STOP, onStop, ctx);
-    createIconButton(rightColumn, LV_SYMBOL_LIST, onShowList, ctx);
+    // WiFi (scansione normale, come la vecchia app) / "CH" = channel hopping (cattura passiva) /
+    // ferma tutto / lista reti / "CLI" = lista client.
+    ctx->scanButton = createIconButton(rightColumn, LV_SYMBOL_WIFI, onStartScan, ctx, BTN);
+    ctx->captureButton = createIconButton(rightColumn, "CH", onStartCapture, ctx, BTN);
+    ctx->stopButton = createIconButton(rightColumn, LV_SYMBOL_STOP, onStop, ctx, BTN);
+    createIconButton(rightColumn, LV_SYMBOL_LIST, onShowList, ctx, BTN);
+    createIconButton(rightColumn, "CLI", onShowClients, ctx, BTN);
     refreshModeButtons(ctx);
 }
 
@@ -1193,23 +1192,21 @@ void createListPage(Context* ctx, lv_obj_t* parent) {
     ctx->listPage = createPage(parent);
     lv_obj_add_flag(ctx->listPage, LV_OBJ_FLAG_HIDDEN);
 
-    ctx->list = lv_obj_create(ctx->listPage);
+    // lv_list (not a bare container): its buttons join the keypad group, so the badge's up/down
+    // keys move the focus and scroll the list - a custom container would not scroll.
+    ctx->list = lv_list_create(ctx->listPage);
     lv_obj_set_size(ctx->list, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_flex_flow(ctx->list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(ctx->list, 2, 0);
-    lv_obj_set_scroll_dir(ctx->list, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(ctx->list, LV_SCROLLBAR_MODE_AUTO);
 }
 
 void createDetailPage(Context* ctx, lv_obj_t* parent) {
     ctx->detailPage = createPage(parent);
     lv_obj_add_flag(ctx->detailPage, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_scroll_dir(ctx->detailPage, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(ctx->detailPage, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_set_style_pad_all(ctx->detailPage, 4, 0);
 
+    // Inverted-bell chart highlighting this network, fixed at the top so it stays visible.
     ctx->detailChart = lv_chart_create(ctx->detailPage);
-    lv_obj_set_size(ctx->detailChart, LV_PCT(100), 70);
+    lv_obj_set_size(ctx->detailChart, LV_PCT(100), 60);
     lv_chart_set_type(ctx->detailChart, LV_CHART_TYPE_LINE);
     lv_chart_set_point_count(ctx->detailChart, CHART_POINTS);
     lv_chart_set_axis_range(ctx->detailChart, LV_CHART_AXIS_PRIMARY_Y, 0, SIGNAL_RANGE_DB);
@@ -1217,31 +1214,31 @@ void createDetailPage(Context* ctx, lv_obj_t* parent) {
     lv_obj_remove_flag(ctx->detailChart, LV_OBJ_FLAG_SCROLLABLE);
     ctx->detailSeries[0] = lv_chart_add_series(ctx->detailChart, lv_color_hex(SERIES_COLORS[0]), LV_CHART_AXIS_PRIMARY_Y);
 
-    ctx->detailInfo = lv_label_create(ctx->detailPage);
+    // The text and the Connect button live in an lv_list so the page scrolls with the badge keys
+    // (focusing the Connect button at the bottom drags the list up to reveal everything).
+    auto* scroll = lv_list_create(ctx->detailPage);
+    lv_obj_set_width(scroll, LV_PCT(100));
+    lv_obj_set_flex_grow(scroll, 1);
+
+    ctx->detailInfo = lv_label_create(scroll);
     lv_label_set_long_mode(ctx->detailInfo, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_width(ctx->detailInfo, LV_PCT(100));
 
-    ctx->detailClients = lv_label_create(ctx->detailPage);
+    ctx->detailClients = lv_label_create(scroll);
     lv_label_set_long_mode(ctx->detailClients, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_width(ctx->detailClients, LV_PCT(100));
 
-    ctx->connectButton = lv_button_create(ctx->detailPage);
-    auto* connectLabel = lv_label_create(ctx->connectButton);
-    lv_label_set_text(connectLabel, "Connetti");
-    lv_obj_center(connectLabel);
-    lv_obj_add_event_cb(ctx->connectButton, onConnectPressed, LV_EVENT_SHORT_CLICKED, ctx);
+    ctx->connectButton = lv_list_add_button(scroll, LV_SYMBOL_WIFI, "Connetti");
+    lv_obj_add_event_cb(ctx->connectButton, onConnectPressed, LV_EVENT_CLICKED, ctx);
 }
 
 void createClientsPage(Context* ctx, lv_obj_t* parent) {
     ctx->clientsPage = createPage(parent);
     lv_obj_add_flag(ctx->clientsPage, LV_OBJ_FLAG_HIDDEN);
 
-    ctx->clientsList = lv_obj_create(ctx->clientsPage);
+    ctx->clientsList = lv_list_create(ctx->clientsPage);
     lv_obj_set_size(ctx->clientsList, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_flex_flow(ctx->clientsList, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(ctx->clientsList, 2, 0);
-    lv_obj_set_scroll_dir(ctx->clientsList, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(ctx->clientsList, LV_SCROLLBAR_MODE_AUTO);
 }
 
 void createWidgets(lv_obj_t* parent, void* userData) {
@@ -1252,7 +1249,6 @@ void createWidgets(lv_obj_t* parent, void* userData) {
 
     ctx->toolbar = lvgl_toolbar_create(parent, "Wi-Fi Scanner");
     lvgl_toolbar_set_nav_action(ctx->toolbar, LV_SYMBOL_CLOSE, onBackPressed, ctx);
-    lvgl_toolbar_add_text_button_action(ctx->toolbar, "Client", onShowClients, ctx);
 
     auto* wrapper = lv_obj_create(parent);
     lv_obj_set_flex_flow(wrapper, LV_FLEX_FLOW_COLUMN);
