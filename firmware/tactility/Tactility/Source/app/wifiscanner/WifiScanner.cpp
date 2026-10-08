@@ -638,17 +638,21 @@ void onShowClients(lv_event_t* event);
 
 void onSelectFromList(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    // current_target is the row the callback is attached to; target could be an inner child
-    // (the colour bar or a field label), whose user_data is null -> key 0 -> network not found.
-    auto key = reinterpret_cast<uint64_t>(lv_obj_get_user_data(lv_event_get_current_target_obj(event)));
+    // The network key is 64-bit but a pointer on the ESP32-S3 is only 32-bit, so it can't be
+    // smuggled through lv_obj user_data (it would be truncated and the lookup would miss). Find
+    // the key by matching the clicked row against ctx->rows instead.
+    lv_obj_t* row = lv_event_get_current_target_obj(event);
+    uint64_t key = 0;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
+        for (const auto& [k, w] : ctx->rows) {
+            if (w == row) { key = k; break; }
+        }
         ctx->selectedKey = key;
-        // Baseline for the "beacon since you opened this" counter.
         auto it = ctx->seen.find(key);
         ctx->detailBeaconBaseline = it != ctx->seen.end() ? it->second.packetCount : 0;
         ctx->mutex.unlock();
     }
-    showPage(ctx, Page::Detail);
+    if (key != 0) showPage(ctx, Page::Detail);
 }
 
 constexpr int LIST_ROW_HEIGHT = 30;
@@ -676,7 +680,7 @@ lv_obj_t* createListRow(Context* ctx, uint64_t key) {
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_all(row, 2, 0);
     lv_obj_set_style_pad_column(row, 4, 0);
-    lv_obj_set_user_data(row, reinterpret_cast<void*>(key));
+    (void)key; // identity is tracked via ctx->rows, not user_data (see onSelectFromList)
     lv_obj_add_event_cb(row, onSelectFromList, LV_EVENT_CLICKED, ctx);
 
     // Colour bar (same colour as this network's bell on the graph), hard left.
@@ -736,10 +740,11 @@ void updateRows(Context* ctx, const std::vector<SeenAp>& aps, const std::map<uin
         snprintf(ssidLine, sizeof(ssidLine), "%s%s", displaySsid(ap.record), ap.fromCapture ? " *" : "");
         lv_label_set_text(lv_obj_get_child(row, 1), ssidLine);
 
+        // Plain numbers only; the legend header above the list says what each column is.
         char channelText[16];
-        char powerText[20];
-        snprintf(channelText, sizeof(channelText), "ch%d", (int)ap.record.channel);
-        snprintf(powerText, sizeof(powerText), "%d dBm", (int)ap.record.rssi);
+        char powerText[16];
+        snprintf(channelText, sizeof(channelText), "%d", (int)ap.record.channel);
+        snprintf(powerText, sizeof(powerText), "%d", (int)ap.record.rssi);
         lv_label_set_text(lv_obj_get_child(row, 2), channelText);
         lv_label_set_text(lv_obj_get_child(row, 3), powerText);
         lv_label_set_text(lv_obj_get_child(row, 4), authToString(ap.record.authentication_type));
@@ -1237,14 +1242,45 @@ void createGraphPage(Context* ctx, lv_obj_t* parent) {
     refreshModeButtons(ctx);
 }
 
+/** Adds a right-aligned fixed-width column label to the legend header (mirrors addFieldLabel). */
+void addLegendLabel(lv_obj_t* header, const char* text, int width) {
+    auto* label = lv_label_create(header);
+    lv_obj_set_width(label, width);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_text(label, text);
+}
+
 void createListPage(Context* ctx, lv_obj_t* parent) {
     ctx->listPage = createPage(parent);
     lv_obj_add_flag(ctx->listPage, LV_OBJ_FLAG_HIDDEN);
 
+    // Legend header, laid out with the same columns as the rows so the titles sit over their
+    // numbers. This lets the rows show bare numbers (no "ch"/"dBm" text eating width).
+    auto* header = lv_obj_create(ctx->listPage);
+    lv_obj_set_size(header, LV_PCT(100), 18);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(header, 2, 0);
+    lv_obj_set_style_pad_column(header, 4, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_remove_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    auto* spacer = lv_obj_create(header); // matches the row's 6px colour bar
+    lv_obj_set_size(spacer, 6, 1);
+    lv_obj_set_style_border_width(spacer, 0, 0);
+    lv_obj_set_style_bg_opa(spacer, LV_OPA_TRANSP, 0);
+    auto* nameHdr = lv_label_create(header);
+    lv_label_set_text(nameHdr, "Rete");
+    lv_obj_set_flex_grow(nameHdr, 1);
+    addLegendLabel(header, "ch", COL_CH);
+    addLegendLabel(header, "dBm", COL_POWER);
+    addLegendLabel(header, "sec", COL_SEC);
+    addLegendLabel(header, "cli", COL_CLI);
+
     // lv_list (not a bare container): its buttons join the keypad group, so the badge's up/down
     // keys move the focus and scroll the list - a custom container would not scroll.
     ctx->list = lv_list_create(ctx->listPage);
-    lv_obj_set_size(ctx->list, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_width(ctx->list, LV_PCT(100));
+    lv_obj_set_flex_grow(ctx->list, 1);
     lv_obj_set_style_pad_row(ctx->list, 2, 0);
 }
 
