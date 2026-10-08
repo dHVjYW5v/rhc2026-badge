@@ -56,8 +56,18 @@ constexpr int32_t SIGNAL_RANGE_DB = 70;
 constexpr uint32_t HOP_INTERVAL_MS = 250;
 constexpr int MAX_PROBED_SSIDS = 4;
 
+// Pure, saturated hues (each uses at most two channels). The old muted palette had a blue
+// component in every colour that was faint on the LCD but strong on the WS2812 LEDs, so "red"
+// lit up purple and "green" cyan. These render the same on screen and on the strip.
 const uint32_t SERIES_COLORS[MAX_SERIES] = {
-    0xE6194B, 0x3CB44B, 0xFFE119, 0x4363D8, 0xF58231, 0x911EB4, 0x42D4F4, 0xF032E6
+    0xFF0000, // red
+    0xFF7F00, // orange
+    0xFFFF00, // yellow
+    0x00FF00, // green
+    0x00FFFF, // cyan
+    0x0000FF, // blue
+    0x8000FF, // violet
+    0xFF00FF, // magenta
 };
 
 enum class Page { Graph, List, Detail, Clients };
@@ -120,7 +130,6 @@ struct Context {
     uint8_t savedR = 0, savedG = 0, savedB = 0, savedBrightness = 0, savedSpeed = 0;
     int ledViewApplied = -1;   // 0 scan, 1 capture, 2 stopped, 3 detail
     int ledColorApplied = -1;
-    int ledBrightnessApplied = -1;
 
     lv_obj_t* toolbar = nullptr;
     lv_obj_t* statusLabel = nullptr;
@@ -562,36 +571,29 @@ void updateLeds(Context* ctx) {
         return;
     }
 
+    // Brightness is never touched here: the strip keeps whatever level it already had, so weak
+    // or hidden networks still light up with their colour.
     if (page == Page::Detail) {
         int colorIdx = 0;
-        int8_t rssi = SIGNAL_FLOOR_DBM;
         bool found = false;
         if (ctx->mutex.lock(0)) {
             auto it = ctx->seen.find(selectedKey);
             if (it != ctx->seen.end()) {
                 colorIdx = it->second.colorIndex % MAX_SERIES;
-                rssi = it->second.record.rssi;
                 found = true;
             }
             ctx->mutex.unlock();
         }
         if (!found) return;
 
-        // Brightness rises with the signal: the closer to the AP, the brighter, up to 100%.
-        int32_t peak = std::clamp<int32_t>(rssi - SIGNAL_FLOOR_DBM, 1, SIGNAL_RANGE_DB);
-        int brightness = (int)(peak * 100 / SIGNAL_RANGE_DB);
-        if (ctx->ledViewApplied == 3 && ctx->ledColorApplied == colorIdx && ctx->ledBrightnessApplied == brightness) {
-            return;
-        }
+        if (ctx->ledViewApplied == 3 && ctx->ledColorApplied == colorIdx) return;
         ctx->ledViewApplied = 3;
         ctx->ledColorApplied = colorIdx;
-        ctx->ledBrightnessApplied = brightness;
 
         uint32_t color = SERIES_COLORS[colorIdx];
         np::setActiveColorMode(np::ColorMode::Static);
         np::setActiveColor((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
         np::setActiveAnimation(np::Animation::Solid);
-        np::setActiveBrightness((uint8_t)brightness);
         return;
     }
 
@@ -600,19 +602,17 @@ void updateLeds(Context* ctx) {
     if (ctx->ledViewApplied == view) return;
     ctx->ledViewApplied = view;
     ctx->ledColorApplied = -1;
-    ctx->ledBrightnessApplied = -1;
 
     if (view == 2) { // stopped -> put the user's own lighting back
         restoreLedConfig(ctx);
         return;
     }
 
-    // A green (active scan) or red (channel hopping) sonar sweep.
+    // A slow sonar wave running back and forth: green for active scan, red for channel hopping.
     np::setActiveColorMode(np::ColorMode::Static);
-    if (view == 0) np::setActiveColor(0, 200, 0);
-    else np::setActiveColor(220, 0, 0);
-    np::setActiveSpeed(12);
-    np::setActiveBrightness(40);
+    if (view == 0) np::setActiveColor(0, 255, 0);
+    else np::setActiveColor(255, 0, 0);
+    np::setActiveSpeed(2); // low = slow, so it glides rather than flickering
     np::setActiveAnimation(np::Animation::Scanner);
 }
 
