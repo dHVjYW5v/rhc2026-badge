@@ -90,8 +90,18 @@ static void default_nav_action(lv_event_t* event) {
     }
 }
 
+static void (*back_override_callback)(void* userData) = nullptr;
+static void* back_override_user_data = nullptr;
+
+void lvgl_toolbar_set_back_override(void (*callback)(void* userData), void* userData) {
+    back_override_callback = callback;
+    back_override_user_data = userData;
+}
+
 void lvgl_toolbar_trigger_back() {
-    if (nav_action_callback != nullptr) {
+    if (back_override_callback != nullptr) {
+        back_override_callback(back_override_user_data);
+    } else if (nav_action_callback != nullptr) {
         nav_action_callback(nullptr);
     }
 }

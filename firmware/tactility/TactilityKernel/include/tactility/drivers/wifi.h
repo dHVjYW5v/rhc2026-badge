@@ -32,11 +32,35 @@ enum WifiAuthenticationType {
     WIFI_AUTHENTICATION_TYPE_MAX
 };
 
+enum WifiCipherType {
+    WIFI_AP_CIPHER_NONE = 0,
+    WIFI_AP_CIPHER_WEP,
+    WIFI_AP_CIPHER_TKIP,
+    WIFI_AP_CIPHER_CCMP,
+    WIFI_AP_CIPHER_TKIP_CCMP,
+    WIFI_AP_CIPHER_GCMP,
+    WIFI_AP_CIPHER_UNKNOWN
+};
+
+/** Bits of WifiApRecord::phy_flags */
+#define WIFI_AP_PHY_11B (1U << 0U)
+#define WIFI_AP_PHY_11G (1U << 1U)
+#define WIFI_AP_PHY_11N (1U << 2U)
+#define WIFI_AP_PHY_11AX (1U << 3U)
+#define WIFI_AP_PHY_WPS (1U << 4U)
+
 struct WifiApRecord {
     char ssid[33]; // 32 bytes + null terminator
     int8_t rssi;
     int32_t channel;
     enum WifiAuthenticationType authentication_type;
+    uint8_t bssid[6];
+    enum WifiCipherType pairwise_cipher;
+    /** 0 = no secondary channel, 1 = above, 2 = below */
+    uint8_t secondary_channel;
+    uint8_t phy_flags;
+    /** Country code announced by the AP, empty when it announces none */
+    char country[3];
 };
 
 enum WifiRadioState {
