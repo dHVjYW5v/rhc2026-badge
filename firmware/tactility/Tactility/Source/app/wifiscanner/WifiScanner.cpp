@@ -1322,22 +1322,26 @@ void stopTimer(Context* ctx) {
 // Fast feed for the detail VU bar: pushing the current level continuously keeps the bar steady
 // (a 1 Hz feed would let the meter drain to zero between pushes and flicker).
 void onLedTimer(Context* ctx) {
+    namespace np = service::neopixel;
     if (!ctx->vuFeeding.load()) return;
     int base = ctx->vuLevel.load();
-
-    // Keep the bar alive: upward spikes around the proximity floor (never below it), so with decay
-    // on the bars shoot up and fall back like an equaliser. Livelier the closer the AP is.
     uint32_t t = lv_tick_get();
-    float glow = sinf((float)(t % 1800) / 1800.0f * 6.2832f);
-    float ripple = sinf((float)(t % 320) / 320.0f * 6.2832f);
-    int amp = base * 22 / 100; // up to ~22% of the base, so far APs stay calm and near ones dance
-    int level = base + (int)(std::fabs(glow * 0.6f + ripple * 0.4f) * amp);
+
+    // The bar LENGTH stays equal to the proximity (truthful distance), with only a tiny ripple at
+    // the tip so it looks alive. The liveliness/"glow" is a breathing BRIGHTNESS pulse instead - the
+    // strip is horizontal, so nothing moves vertically; the lit length just glows.
+    float tip = sinf((float)(t % 700) / 700.0f * 6.2832f);
+    int level = base + (int)(tip * base * 0.05f);
     if (level < 0) level = 0;
     if (level > 255) level = 255;
 
-    service::neopixel::VuLevels levels{};
+    int baseBright = ctx->savedBrightness != 0 ? ctx->savedBrightness : 60;
+    float breath = 0.5f + 0.5f * sinf((float)(t % 1600) / 1600.0f * 6.2832f); // 0..1
+    np::setVuBrightness((uint8_t)(baseBright * (0.6f + 0.4f * breath)));       // 60%..100%
+
+    np::VuLevels levels{};
     levels.left = levels.right = levels.bass = levels.mid = levels.treble = (uint8_t)level;
-    service::neopixel::setVuLevels(levels);
+    np::setVuLevels(levels);
 }
 
 // ---- Widget construction ----
