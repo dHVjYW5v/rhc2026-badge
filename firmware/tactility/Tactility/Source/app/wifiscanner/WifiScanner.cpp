@@ -57,7 +57,7 @@ constexpr float CH_AXIS_MIN = 0.0f;
 constexpr float CH_AXIS_MAX = 14.0f;
 constexpr int32_t SIGNAL_FLOOR_DBM = -100;
 constexpr int32_t SIGNAL_RANGE_DB = 70;
-constexpr uint32_t HOP_INTERVAL_MS = 250;
+constexpr uint32_t HOP_INTERVAL_MS = 400;
 constexpr int MAX_PROBED_SSIDS = 4;
 
 /** Fraction 0..1 of the chart width where a channel's vertical line / bell peak sits. */
