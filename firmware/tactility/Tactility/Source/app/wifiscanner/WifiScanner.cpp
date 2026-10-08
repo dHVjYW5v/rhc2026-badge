@@ -46,15 +46,24 @@ constexpr uint16_t MAX_RECORDS = 40;
 constexpr uint32_t REFRESH_MS = 1000;
 constexpr uint32_t ROW_EXPIRY_MS = 20000;
 
-// The chart spans channel -1 to 15 in half-channel steps, so channels 1..13 sit inside with margin
-// for the bell of the outermost ones. An AP's bell is +-2 channels wide (a 20 MHz signal).
+// The chart's x-axis runs from channel CH_AXIS_MIN to CH_AXIS_MAX across CHART_POINTS samples.
+// Channels 1..13 sit inside with a small margin for the outer bells. An AP's bell is +-2 channels
+// wide (a 20 MHz signal). A tighter range than the old -1..15 so the channel scale uses more of
+// the (wider) chart area.
 constexpr int MAX_SERIES = 8;
 constexpr int CHART_POINTS = 33;
 constexpr float BELL_HALF_WIDTH = 2.0f;
+constexpr float CH_AXIS_MIN = 0.0f;
+constexpr float CH_AXIS_MAX = 14.0f;
 constexpr int32_t SIGNAL_FLOOR_DBM = -100;
 constexpr int32_t SIGNAL_RANGE_DB = 70;
 constexpr uint32_t HOP_INTERVAL_MS = 250;
 constexpr int MAX_PROBED_SSIDS = 4;
+
+/** Fraction 0..1 of the chart width where a channel's vertical line / bell peak sits. */
+inline float channelFraction(int channel) {
+    return ((float)channel - CH_AXIS_MIN) / (CH_AXIS_MAX - CH_AXIS_MIN);
+}
 
 // Pure, saturated hues (each uses at most two channels). The old muted palette had a blue
 // component in every colour that was faint on the LCD but strong on the WS2812 LEDs, so "red"
@@ -128,6 +137,12 @@ struct Context {
     service::neopixel::Animation savedAnim = service::neopixel::Animation::Off;
     service::neopixel::ColorMode savedColorMode = service::neopixel::ColorMode::Static;
     uint8_t savedR = 0, savedG = 0, savedB = 0, savedBrightness = 0, savedSpeed = 0;
+    // Saved VU-meter config: the detail page borrows the meter to draw a proximity bar, so we put
+    // the user's meter settings back on exit.
+    bool savedVuActive = false, savedVuDecay = false, savedVuAutoGain = false, savedVuBeatFlash = false, savedVuPeakHold = false;
+    service::neopixel::VuPalette savedVuPalette = service::neopixel::VuPalette::Classic;
+    service::neopixel::VuOrigin savedVuOrigin = service::neopixel::VuOrigin::BothLeft;
+    uint8_t savedVuR = 0, savedVuG = 0, savedVuB = 0, savedVuBrightness = 0, savedVuSensitivity = 0;
     int ledViewApplied = -1;   // 0 scan, 1 capture, 2 stopped, 3 detail
     int ledColorApplied = -1;
 
@@ -480,8 +495,9 @@ void connectTo(Context* ctx, const std::string& ssid) {
 void fillBell(lv_obj_t* chart, lv_chart_series_t* series, int channel, int8_t rssi) {
     int32_t values[CHART_POINTS];
     int32_t height = std::clamp<int32_t>(rssi - SIGNAL_FLOOR_DBM, 1, SIGNAL_RANGE_DB);
+    float step = (CH_AXIS_MAX - CH_AXIS_MIN) / (CHART_POINTS - 1);
     for (int i = 0; i < CHART_POINTS; i++) {
-        float x = -1.0f + 0.5f * i;
+        float x = CH_AXIS_MIN + step * i;
         float distance = std::fabs(x - (float)channel) / BELL_HALF_WIDTH;
         values[i] = distance <= 1.0f ? (int32_t)(height * (1.0f - distance * distance)) : LV_CHART_POINT_NONE;
     }
@@ -541,12 +557,33 @@ void saveLedConfig(Context* ctx) {
     np::getActiveColor(&ctx->savedR, &ctx->savedG, &ctx->savedB);
     ctx->savedBrightness = np::getActiveBrightness();
     ctx->savedSpeed = np::getActiveSpeed();
+    ctx->savedVuActive = np::isVuActive();
+    ctx->savedVuDecay = np::isVuDecayEnabled();
+    ctx->savedVuAutoGain = np::isVuAutoGainEnabled();
+    ctx->savedVuBeatFlash = np::isVuBeatFlashEnabled();
+    ctx->savedVuPeakHold = np::isVuPeakHoldEnabled();
+    ctx->savedVuPalette = np::getVuPalette();
+    ctx->savedVuOrigin = np::getVuOrigin();
+    np::getVuColor(&ctx->savedVuR, &ctx->savedVuG, &ctx->savedVuB);
+    ctx->savedVuBrightness = np::getVuBrightness();
+    ctx->savedVuSensitivity = np::getVuSensitivity();
     ctx->ledSaved = true;
 }
 
 void restoreLedConfig(Context* ctx) {
     namespace np = service::neopixel;
     if (!ctx->ledSaved) return;
+    // Put the VU meter back the way the user had it, then the Active-stage animation.
+    np::setVuPalette(ctx->savedVuPalette);
+    np::setVuOrigin(ctx->savedVuOrigin);
+    np::setVuColor(ctx->savedVuR, ctx->savedVuG, ctx->savedVuB);
+    np::setVuBrightness(ctx->savedVuBrightness);
+    np::setVuSensitivity(ctx->savedVuSensitivity);
+    np::setVuDecayEnabled(ctx->savedVuDecay);
+    np::setVuAutoGainEnabled(ctx->savedVuAutoGain);
+    np::setVuBeatFlashEnabled(ctx->savedVuBeatFlash);
+    np::setVuPeakHoldEnabled(ctx->savedVuPeakHold);
+    np::setVuActive(ctx->savedVuActive);
     np::setActiveColorMode(ctx->savedColorMode);
     np::setActiveColor(ctx->savedR, ctx->savedG, ctx->savedB);
     np::setActiveSpeed(ctx->savedSpeed);
@@ -571,31 +608,52 @@ void updateLeds(Context* ctx) {
         return;
     }
 
-    // Brightness is never touched here: the strip keeps whatever level it already had, so weak
-    // or hidden networks still light up with their colour.
     if (page == Page::Detail) {
         int colorIdx = 0;
+        int8_t rssi = SIGNAL_FLOOR_DBM;
         bool found = false;
         if (ctx->mutex.lock(0)) {
             auto it = ctx->seen.find(selectedKey);
             if (it != ctx->seen.end()) {
                 colorIdx = it->second.colorIndex % MAX_SERIES;
+                rssi = it->second.record.rssi;
                 found = true;
             }
             ctx->mutex.unlock();
         }
         if (!found) return;
 
-        if (ctx->ledViewApplied == 3 && ctx->ledColorApplied == colorIdx) return;
-        ctx->ledViewApplied = 3;
-        ctx->ledColorApplied = colorIdx;
-
-        uint32_t color = SERIES_COLORS[colorIdx];
-        np::setActiveColorMode(np::ColorMode::Static);
-        np::setActiveColor((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
-        np::setActiveAnimation(np::Animation::Solid);
+        // Borrow the VU meter to draw a proximity bar: the strip fills up like an equaliser, in
+        // the network's colour, more LEDs lit the closer (stronger) the AP is.
+        if (ctx->ledViewApplied != 3) {
+            np::setVuPalette(np::VuPalette::Solid);
+            np::setVuOrigin(np::VuOrigin::BothLeft);
+            np::setVuDecayEnabled(false);     // follow the level exactly, no bouncing
+            np::setVuAutoGainEnabled(false);  // our mapping is already the full scale
+            np::setVuBeatFlashEnabled(false);
+            np::setVuPeakHoldEnabled(false);
+            np::setVuSensitivity(100);        // show the whole range we feed
+            np::setVuBrightness(ctx->savedBrightness != 0 ? ctx->savedBrightness : 60);
+            np::setVuActive(true);
+            ctx->ledViewApplied = 3;
+            ctx->ledColorApplied = -1;
+        }
+        if (ctx->ledColorApplied != colorIdx) {
+            uint32_t color = SERIES_COLORS[colorIdx];
+            np::setVuColor((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
+            ctx->ledColorApplied = colorIdx;
+        }
+        // Map signal to bar height: far (floor) -> empty, near -> full.
+        int32_t peak = std::clamp<int32_t>(rssi - SIGNAL_FLOOR_DBM, 0, SIGNAL_RANGE_DB);
+        uint8_t level = (uint8_t)(peak * 255 / SIGNAL_RANGE_DB);
+        service::neopixel::VuLevels levels{};
+        levels.left = levels.right = levels.bass = levels.mid = levels.treble = level;
+        np::setVuLevels(levels);
         return;
     }
+
+    // Leaving the detail: hand the meter back before drawing the mode animation.
+    if (ctx->ledViewApplied == 3) np::setVuActive(false);
 
     // Graph / list: the strip reflects the capture state.
     int view = mode == RadioMode::Capture ? 1 : (mode == RadioMode::ActiveScan ? 0 : 2);
@@ -652,9 +710,8 @@ void updateGraph(Context* ctx, const std::vector<SeenAp>& aps) {
         int width = lv_obj_get_width(label);
         int height = lv_obj_get_height(label);
 
-        // X: centered on the bell's peak. A channel's peak is at (channel+1)/16 of the plot width
-        // (same fraction createAxisLabels uses for the channel numbers).
-        int xPx = chartWidth * (ap.record.channel + 1) / 16 - width / 2;
+        // X: centered on the bell's peak (same fraction as the channel number / reference line).
+        int xPx = (int)(chartWidth * channelFraction(ap.record.channel)) - width / 2;
         if (xPx < 0) xPx = 0;
         if (xPx + width > chartWidth) xPx = chartWidth - width;
 
@@ -1255,8 +1312,24 @@ void createAxisLabels(lv_obj_t* parent) {
         snprintf(text, sizeof(text), "%d", channel);
         auto* label = lv_label_create(row);
         lv_label_set_text(label, text);
-        lv_obj_set_x(label, lv_pct(100 * (channel + 1) / 16));
+        lv_obj_set_x(label, lv_pct((int)(100 * channelFraction(channel))));
         lv_obj_set_style_translate_x(label, channel < 10 ? -4 : -8, 0);
+    }
+}
+
+/** Thin vertical reference lines centred on each channel number, so you can read which channel a
+ * bell sits on. Placed over the chart, behind the name labels. */
+void createChannelGrid(lv_obj_t* chartWrapper) {
+    for (int channel = 1; channel <= 13; channel++) {
+        auto* line = lv_obj_create(chartWrapper);
+        lv_obj_set_size(line, 1, LV_PCT(100));
+        lv_obj_set_style_border_width(line, 0, 0);
+        lv_obj_set_style_radius(line, 0, 0);
+        lv_obj_set_style_bg_color(line, lv_color_hex(0x606060), 0);
+        lv_obj_set_style_bg_opa(line, LV_OPA_50, 0);
+        lv_obj_remove_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(line, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_x(line, lv_pct((int)(100 * channelFraction(channel))));
     }
 }
 
@@ -1319,6 +1392,8 @@ void createGraphPage(Context* ctx, lv_obj_t* parent) {
         ctx->series[i] = lv_chart_add_series(ctx->chart, lv_color_hex(SERIES_COLORS[i]), LV_CHART_AXIS_PRIMARY_Y);
         lv_chart_hide_series(ctx->chart, ctx->series[i], true);
     }
+
+    createChannelGrid(chartWrapper); // vertical reference lines on the channel numbers
 
     ctx->labelLayer = lv_obj_create(chartWrapper);
     lv_obj_set_size(ctx->labelLayer, LV_PCT(100), LV_PCT(100));
