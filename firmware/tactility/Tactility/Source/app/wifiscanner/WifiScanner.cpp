@@ -528,10 +528,11 @@ void updateGraph(Context* ctx, const std::vector<SeenAp>& aps) {
         lv_obj_set_style_text_color(label, lv_color_hex(SERIES_COLORS[used]), 0);
         lv_obj_update_layout(label);
         int width = lv_obj_get_width(label);
-        // Peak sits at channel/16 of the chart's width (see createAxisLabels); nudge left/right
+        // Peak sits at (channel+1)/16 of the chart's width (see createAxisLabels - same formula
+        // as the axis numbers, so a bell lines up under its own channel label); nudge left/right
         // to avoid overlapping a previously placed label at a nearby channel.
         int chartWidth = lv_obj_get_width(ctx->chart);
-        int xPx = chartWidth * ap.record.channel / 16 - width / 2;
+        int xPx = chartWidth * (ap.record.channel + 1) / 16 - width / 2;
         for (const auto& other : placed) {
             if (xPx < other.x + other.width + 2 && xPx + width + 2 > other.x) {
                 xPx = other.x + other.width + 2;
@@ -587,25 +588,46 @@ void onSelectFromList(lv_event_t* event) {
     showPage(ctx, Page::Detail);
 }
 
+constexpr int LIST_ROW_HEIGHT = 54;
+constexpr int LIST_STATS_WIDTH = 74;
+
 lv_obj_t* createListRow(Context* ctx, uint64_t key) {
     auto* row = lv_obj_create(ctx->list);
-    lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_size(row, LV_PCT(100), LIST_ROW_HEIGHT);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_all(row, 4, 0);
     lv_obj_set_style_pad_column(row, 6, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE); // a scrollable row fights the list's own scroll
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_user_data(row, reinterpret_cast<void*>(key));
     lv_obj_add_event_cb(row, onSelectFromList, LV_EVENT_SHORT_CLICKED, ctx);
 
     auto* chip = lv_obj_create(row);
-    lv_obj_set_size(chip, 8, LV_PCT(100));
+    lv_obj_set_size(chip, 5, LV_PCT(100));
     lv_obj_set_style_radius(chip, 2, 0);
     lv_obj_set_style_border_width(chip, 0, 0);
     lv_obj_remove_flag(chip, LV_OBJ_FLAG_SCROLLABLE);
 
+    // The SSID scrolls like a bus sign when it's longer than the space left for it.
     auto* label = lv_label_create(row);
-    lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOTS);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);
     lv_obj_set_flex_grow(label, 1);
+    lv_obj_set_height(label, LV_SIZE_CONTENT);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 0, 0);
+
+    // Channel / power / security stacked, one under the other, in a fixed-width column on the right.
+    auto* stats = lv_obj_create(row);
+    lv_obj_set_size(stats, LIST_STATS_WIDTH, LV_PCT(100));
+    lv_obj_set_flex_flow(stats, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(stats, 0, 0);
+    lv_obj_set_style_border_width(stats, 0, 0);
+    lv_obj_remove_flag(stats, LV_OBJ_FLAG_SCROLLABLE);
+    for (int i = 0; i < 3; i++) {
+        auto* statLabel = lv_label_create(stats);
+        lv_obj_set_width(statLabel, LV_PCT(100));
+        lv_obj_set_style_text_align(statLabel, LV_TEXT_ALIGN_RIGHT, 0);
+    }
 
     return row;
 }
@@ -642,10 +664,18 @@ void updateRows(Context* ctx, const std::vector<SeenAp>& aps) {
         lv_obj_set_style_bg_opa(chip, LV_OPA_COVER, 0);
 
         auto* label = lv_obj_get_child(row, 1);
-        char line[112];
-        snprintf(line, sizeof(line), "%s  ch%d  %d dBm  %s%s", displaySsid(ap.record), (int)ap.record.channel,
-            (int)ap.record.rssi, authToString(ap.record.authentication_type), ap.fromCapture ? " (cattura)" : "");
-        lv_label_set_text(label, line);
+        char ssidLine[48];
+        snprintf(ssidLine, sizeof(ssidLine), "%s%s", displaySsid(ap.record), ap.fromCapture ? " (cattura)" : "");
+        lv_label_set_text(label, ssidLine);
+
+        auto* stats = lv_obj_get_child(row, 2);
+        char channelText[8];
+        char powerText[12];
+        snprintf(channelText, sizeof(channelText), "ch%d", (int)ap.record.channel);
+        snprintf(powerText, sizeof(powerText), "%d dBm", (int)ap.record.rssi);
+        lv_label_set_text(lv_obj_get_child(stats, 0), channelText);
+        lv_label_set_text(lv_obj_get_child(stats, 1), powerText);
+        lv_label_set_text(lv_obj_get_child(stats, 2), authToString(ap.record.authentication_type));
     }
 
     // Re-order to match the sorted-by-RSSI list.
@@ -936,32 +966,37 @@ lv_obj_t* createIconButton(lv_obj_t* parent, const char* icon, lv_event_cb_t cal
 void createGraphPage(Context* ctx, lv_obj_t* parent) {
     ctx->graphPage = createPage(parent);
 
-    auto* top = lv_obj_create(ctx->graphPage);
-    lv_obj_set_size(top, LV_PCT(100), LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(top, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_all(top, 0, 0);
-    lv_obj_set_style_pad_column(top, 4, 0);
-    lv_obj_set_style_border_width(top, 0, 0);
-    lv_obj_remove_flag(top, LV_OBJ_FLAG_SCROLLABLE);
+    // Everything but the button column lives in the left side, so the buttons never eat into
+    // the chart's own height.
+    auto* mainRow = lv_obj_create(ctx->graphPage);
+    lv_obj_set_size(mainRow, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_flex_flow(mainRow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_all(mainRow, 0, 0);
+    lv_obj_set_style_pad_column(mainRow, 4, 0);
+    lv_obj_set_style_border_width(mainRow, 0, 0);
+    lv_obj_remove_flag(mainRow, LV_OBJ_FLAG_SCROLLABLE);
 
-    ctx->statusLabel = lv_label_create(top);
+    auto* leftColumn = lv_obj_create(mainRow);
+    lv_obj_set_flex_flow(leftColumn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_height(leftColumn, LV_PCT(100));
+    lv_obj_set_flex_grow(leftColumn, 1);
+    lv_obj_set_style_pad_all(leftColumn, 0, 0);
+    lv_obj_set_style_border_width(leftColumn, 0, 0);
+    lv_obj_remove_flag(leftColumn, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->statusLabel = lv_label_create(leftColumn);
     lv_label_set_text(ctx->statusLabel, "...");
-    lv_obj_set_flex_grow(ctx->statusLabel, 1);
+    lv_obj_set_width(ctx->statusLabel, LV_PCT(100));
 
-    ctx->startButton = createIconButton(top, LV_SYMBOL_PLAY, onStartCapture, ctx);
-    ctx->stopButton = createIconButton(top, LV_SYMBOL_STOP, onStopCapture, ctx);
-    lv_obj_add_state(ctx->stopButton, LV_STATE_DISABLED);
-    if (!isCaptureSupported()) lv_obj_add_state(ctx->startButton, LV_STATE_DISABLED);
-    createIconButton(top, LV_SYMBOL_LIST, onShowList, ctx);
-
-    auto* chartWrapper = lv_obj_create(ctx->graphPage);
-    lv_obj_set_size(chartWrapper, LV_PCT(100), 100);
+    auto* chartWrapper = lv_obj_create(leftColumn);
+    lv_obj_set_width(chartWrapper, LV_PCT(100));
+    lv_obj_set_flex_grow(chartWrapper, 1);
     lv_obj_set_style_pad_all(chartWrapper, 0, 0);
     lv_obj_set_style_border_width(chartWrapper, 0, 0);
     lv_obj_remove_flag(chartWrapper, LV_OBJ_FLAG_SCROLLABLE);
 
     ctx->chart = lv_chart_create(chartWrapper);
-    lv_obj_set_size(ctx->chart, LV_PCT(100), 100);
+    lv_obj_set_size(ctx->chart, LV_PCT(100), LV_PCT(100));
     lv_obj_set_style_pad_all(ctx->chart, 0, 0);
     lv_chart_set_type(ctx->chart, LV_CHART_TYPE_LINE);
     lv_chart_set_point_count(ctx->chart, CHART_POINTS);
@@ -976,14 +1011,29 @@ void createGraphPage(Context* ctx, lv_obj_t* parent) {
     }
 
     ctx->labelLayer = lv_obj_create(chartWrapper);
-    lv_obj_set_size(ctx->labelLayer, LV_PCT(100), 100);
+    lv_obj_set_size(ctx->labelLayer, LV_PCT(100), LV_PCT(100));
     lv_obj_set_style_pad_all(ctx->labelLayer, 0, 0);
     lv_obj_set_style_bg_opa(ctx->labelLayer, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(ctx->labelLayer, 0, 0);
     lv_obj_remove_flag(ctx->labelLayer, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(ctx->labelLayer, LV_OBJ_FLAG_CLICKABLE);
 
-    createAxisLabels(ctx->graphPage);
+    createAxisLabels(leftColumn);
+
+    // Small icon buttons, stacked, pinned to the far right - like the old single list button.
+    auto* rightColumn = lv_obj_create(mainRow);
+    lv_obj_set_size(rightColumn, 40, LV_PCT(100));
+    lv_obj_set_flex_flow(rightColumn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(rightColumn, 0, 0);
+    lv_obj_set_style_pad_row(rightColumn, 4, 0);
+    lv_obj_set_style_border_width(rightColumn, 0, 0);
+    lv_obj_remove_flag(rightColumn, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->startButton = createIconButton(rightColumn, LV_SYMBOL_PLAY, onStartCapture, ctx);
+    ctx->stopButton = createIconButton(rightColumn, LV_SYMBOL_STOP, onStopCapture, ctx);
+    lv_obj_add_state(ctx->stopButton, LV_STATE_DISABLED);
+    if (!isCaptureSupported()) lv_obj_add_state(ctx->startButton, LV_STATE_DISABLED);
+    createIconButton(rightColumn, LV_SYMBOL_LIST, onShowList, ctx);
 }
 
 void createListPage(Context* ctx, lv_obj_t* parent) {
