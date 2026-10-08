@@ -31,8 +31,10 @@
 
 #ifdef ESP_PLATFORM
 #include <esp_wifi.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <sys/stat.h>
 #endif
 
 namespace tt::app::wifiscanner {
@@ -104,6 +106,23 @@ struct SeenAp {
     int colorIndex = 0;
 };
 
+// Handshake / PMKID capture: we buffer the raw 802.11 frames in RAM (never touch the SD from the
+// promiscuous callback) and a periodic flush writes a .pcap per network to /sdcard/handshakes.
+constexpr int HS_MAX_APS = 16;
+constexpr int HS_FRAME_MAX = 320;  // one 802.11 frame (EAPOL or beacon) we keep
+constexpr int HS_BEACON_MAX = 400;
+
+struct HandshakeCapture {
+    char ssid[33] = {};
+    uint8_t beacon[HS_BEACON_MAX] = {};
+    int beaconLen = 0;
+    uint8_t eapol[4][HS_FRAME_MAX] = {}; // M1..M4, whole 802.11 frames
+    int eapolLen[4] = {0, 0, 0, 0};
+    uint8_t msgMask = 0;   // bit i set once Mi+1 is captured
+    bool hasPmkid = false;
+    bool saved = false;
+};
+
 /** A device seen only through passive capture: probing for a network, or associated to one. */
 struct CapturedClient {
     uint8_t mac[6] = {};
@@ -131,6 +150,9 @@ struct Context {
     Page page = Page::Graph;
     std::map<uint64_t, SeenAp> seen;
     std::map<uint64_t, CapturedClient> clients;
+    std::map<uint64_t, HandshakeCapture> handshakes;
+    int handshakesSaved = 0; // .pcap files written this session
+    int pmkidSeen = 0;
     std::vector<uint64_t> visible; // sorted by RSSI, rebuilt each refresh
     uint64_t selectedKey = 0;
     uint32_t detailBeaconBaseline = 0;
@@ -313,6 +335,77 @@ void upsertClientAssociation(Context* ctx, const uint8_t* mac, const uint8_t* bs
     ctx->mutex.unlock();
 }
 
+/** Stores a raw beacon for an AP we're already collecting a handshake for (gives the .pcap its
+ * SSID). Only kept for tracked BSSIDs, to bound RAM. */
+void storeBeaconForHandshake(Context* ctx, const uint8_t* bssid, const uint8_t* frame, int len, const std::string& ssid) {
+    if (!ctx->mutex.lock(0)) return;
+    auto it = ctx->handshakes.find(bssidKey(bssid));
+    if (it != ctx->handshakes.end() && it->second.beaconLen == 0) {
+        int n = std::min(len, HS_BEACON_MAX);
+        memcpy(it->second.beacon, frame, n);
+        it->second.beaconLen = n;
+        if (!ssid.empty() && it->second.ssid[0] == '\0') {
+            size_t s = std::min(ssid.size(), sizeof(it->second.ssid) - 1);
+            memcpy(it->second.ssid, ssid.data(), s);
+            it->second.ssid[s] = '\0';
+        }
+    }
+    ctx->mutex.unlock();
+}
+
+/** Detects an EAPOL-Key frame (the WPA 4-way handshake) and buffers the whole 802.11 frame in the
+ * right message slot (M1..M4) for its AP. Also flags a PMKID when the AP exposes one in M1. */
+void handleEapol(Context* ctx, const uint8_t* payload, int len, uint8_t subtype, const uint8_t* addr1, const uint8_t* addr2) {
+    int hdr = 24;
+    if (subtype & 0x08) hdr += 2; // QoS data carries a 2-byte QoS control field
+    if (len < hdr + 8 + 7) return;
+    const uint8_t* llc = payload + hdr;
+    if (!(llc[0] == 0xAA && llc[1] == 0xAA && llc[2] == 0x03)) return; // not LLC/SNAP
+    if (((llc[6] << 8) | llc[7]) != 0x888E) return;                    // not EAPOL
+    const uint8_t* eapol = llc + 8;
+    int eapolLen = len - hdr - 8;
+    if (eapolLen < 7 || eapol[1] != 0x03) return;                      // EAPOL-Key only
+    uint16_t keyInfo = (eapol[5] << 8) | eapol[6];
+    bool mic = keyInfo & 0x0100, ack = keyInfo & 0x0080, install = keyInfo & 0x0040, secure = keyInfo & 0x0200;
+    int slot;
+    if (ack && !mic) slot = 0;                  // M1 (AP -> STA)
+    else if (mic && !ack && !secure) slot = 1;  // M2 (STA -> AP)
+    else if (ack && mic && install) slot = 2;   // M3 (AP -> STA)
+    else if (mic && !ack && secure) slot = 3;   // M4 (STA -> AP)
+    else return;
+    const uint8_t* bssid = (slot == 0 || slot == 2) ? addr2 : addr1;   // the AP side
+
+    bool pmkid = false;
+    if (slot == 0) {
+        for (int i = 0; i + 6 <= eapolLen; i++) {
+            if (eapol[i] == 0xDD && eapol[i + 2] == 0x00 && eapol[i + 3] == 0x0F &&
+                eapol[i + 4] == 0xAC && eapol[i + 5] == 0x04) { pmkid = true; break; }
+        }
+    }
+
+    if (!ctx->mutex.lock(0)) return;
+    uint64_t key = bssidKey(bssid);
+    auto it = ctx->handshakes.find(key);
+    if (it == ctx->handshakes.end()) {
+        if ((int)ctx->handshakes.size() >= HS_MAX_APS) { ctx->mutex.unlock(); return; }
+        it = ctx->handshakes.emplace(key, HandshakeCapture{}).first;
+        auto sit = ctx->seen.find(key);
+        if (sit != ctx->seen.end()) {
+            strncpy(it->second.ssid, sit->second.record.ssid, sizeof(it->second.ssid) - 1);
+        }
+    }
+    HandshakeCapture& hc = it->second;
+    if (hc.eapolLen[slot] == 0) {
+        int n = std::min(len, HS_FRAME_MAX);
+        memcpy(hc.eapol[slot], payload, n);
+        hc.eapolLen[slot] = n;
+        hc.msgMask |= (uint8_t)(1 << slot);
+        hc.saved = false; // a new message arrived - allow a re-save with more of the handshake
+    }
+    if (pmkid && !hc.hasPmkid) { hc.hasPmkid = true; ctx->pmkidSeen++; }
+    ctx->mutex.unlock();
+}
+
 /** Runs on the ESP-IDF WiFi task context (guaranteed by esp_wifi_set_promiscuous_rx_cb). */
 void onPromiscuousPacket(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
@@ -343,6 +436,7 @@ void onPromiscuousPacket(void* buf, wifi_promiscuous_pkt_type_t type) {
             WifiAuthenticationType auth = WIFI_AUTHENTICATION_TYPE_OPEN;
             parseBeaconIes(payload + 24 + 12, len - 24 - 12, capability, ssid, ssidSeen, auth);
             upsertApFromCapture(ctx, addr3, ssid, ssidSeen, channel, rssi, auth);
+            storeBeaconForHandshake(ctx, addr3, payload, len, ssid);
         } else if (frameSubtype == 4) { // probe request
             std::string ssid = parseProbeRequestSsid(payload + 24, len - 24);
             upsertClientProbe(ctx, addr2, ssid, rssi);
@@ -355,6 +449,7 @@ void onPromiscuousPacket(void* buf, wifi_promiscuous_pkt_type_t type) {
             // AP -> client: the client is the receiver (addr1), AP is addr2
             upsertClientAssociation(ctx, addr1, addr2, rssi, false);
         }
+        handleEapol(ctx, payload, len, frameSubtype, addr1, addr2); // 4-way handshake / PMKID
     }
 }
 
@@ -409,6 +504,51 @@ void stopCapture(Context* ctx) {
 
 bool isCaptureSupported() { return true; }
 
+// ---- .pcap writing (handshake export to SD) ----
+
+void pcapU32(FILE* f, uint32_t v) { fwrite(&v, 4, 1, f); } // ESP32 is little-endian = pcap LE
+void pcapU16(FILE* f, uint16_t v) { fwrite(&v, 2, 1, f); }
+
+void pcapRecord(FILE* f, const uint8_t* data, int len) {
+    uint64_t us = (uint64_t)esp_timer_get_time();
+    pcapU32(f, (uint32_t)(us / 1000000));
+    pcapU32(f, (uint32_t)(us % 1000000));
+    pcapU32(f, (uint32_t)len);
+    pcapU32(f, (uint32_t)len);
+    fwrite(data, 1, len, f);
+}
+
+/** Writes beacon + captured EAPOL frames as a LINKTYPE_IEEE802_11 .pcap under /sdcard/handshakes.
+ * Crack on a PC: hcxpcapngtool file.pcap -o hash.22000  (then hashcat -m 22000), or aircrack-ng. */
+bool savePcap(const HandshakeCapture& hc, uint64_t bssidKeyVal) {
+    mkdir("/sdcard/wifi-scanner", 0777); // mkdir doesn't create parents, so make each level
+    mkdir("/sdcard/wifi-scanner/handshakes", 0777);
+    char safe[33];
+    int j = 0;
+    for (int i = 0; hc.ssid[i] != '\0' && j < 32; i++) {
+        char c = hc.ssid[i];
+        safe[j++] = (c > 32 && c < 127 && c != '/' && c != '\\') ? c : '_';
+    }
+    safe[j] = '\0';
+    char path[112];
+    snprintf(path, sizeof(path), "/sdcard/wifi-scanner/handshakes/%s_%012llX.pcap",
+        safe[0] != '\0' ? safe : "hidden", (unsigned long long)bssidKeyVal);
+
+    FILE* f = fopen(path, "wb");
+    if (f == nullptr) return false;
+    pcapU32(f, 0xA1B2C3D4); // magic
+    pcapU16(f, 2); pcapU16(f, 4); // version 2.4
+    pcapU32(f, 0); pcapU32(f, 0); // thiszone, sigfigs
+    pcapU32(f, 65535);            // snaplen
+    pcapU32(f, 105);              // LINKTYPE_IEEE802_11
+    if (hc.beaconLen > 0) pcapRecord(f, hc.beacon, hc.beaconLen);
+    for (int s = 0; s < 4; s++) {
+        if (hc.eapolLen[s] > 0) pcapRecord(f, hc.eapol[s], hc.eapolLen[s]);
+    }
+    fclose(f);
+    return true;
+}
+
 #else
 
 void startCapture(Context*) {}
@@ -416,6 +556,38 @@ void stopCapture(Context*) {}
 bool isCaptureSupported() { return false; }
 
 #endif // ESP_PLATFORM
+
+/** A handshake is worth saving once we have M1+M2 (enough to crack) or a PMKID. Called from the
+ * app timer (not the RX callback): copies one ready capture out under the lock, then writes it to
+ * SD outside the lock so the slow card I/O never blocks packet reception. */
+void flushHandshakes(Context* ctx) {
+#ifdef ESP_PLATFORM
+    auto ready = std::make_unique<HandshakeCapture>();
+    uint64_t key = 0;
+    bool have = false;
+    if (ctx->mutex.lock(50 / portTICK_PERIOD_MS)) {
+        for (auto& [k, hc] : ctx->handshakes) {
+            bool crackable = ((hc.msgMask & 0x03) == 0x03) || hc.hasPmkid; // M1+M2, or PMKID
+            if (crackable && !hc.saved) {
+                *ready = hc;
+                key = k;
+                hc.saved = true;
+                have = true;
+                break;
+            }
+        }
+        ctx->mutex.unlock();
+    }
+    if (have && savePcap(*ready, key)) {
+        if (ctx->mutex.lock(50 / portTICK_PERIOD_MS)) {
+            ctx->handshakesSaved++;
+            ctx->mutex.unlock();
+        }
+    }
+#else
+    (void)ctx;
+#endif
+}
 
 // ---- Formatting helpers ----
 
@@ -964,6 +1136,7 @@ void updateDetail(Context* ctx) {
     bool found = false;
     uint32_t beaconBaseline = 0;
     int clientCount = 0;
+    bool hsPresent = false, hsHas[4] = {}, hsPmkid = false, hsSaved = false;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
         auto it = ctx->seen.find(ctx->selectedKey);
         if (it != ctx->seen.end()) {
@@ -972,6 +1145,13 @@ void updateDetail(Context* ctx) {
             beaconBaseline = ctx->detailBeaconBaseline;
             for (const auto& [clientKey, client] : ctx->clients) {
                 if (client.associatedBssid == ctx->selectedKey) clientCount++;
+            }
+            auto hit = ctx->handshakes.find(ctx->selectedKey);
+            if (hit != ctx->handshakes.end()) {
+                hsPresent = true;
+                for (int s = 0; s < 4; s++) hsHas[s] = (hit->second.msgMask & (1 << s)) != 0;
+                hsPmkid = hit->second.hasPmkid;
+                hsSaved = hit->second.saved;
             }
         }
         ctx->mutex.unlock();
@@ -1013,7 +1193,17 @@ void updateDetail(Context* ctx) {
         (unsigned)((now - ap.firstSeenMs) / 1000), (unsigned)((now - ap.lastSeenMs) / 1000));
 
     if (ap.record.country[0] != '\0') {
-        snprintf(text + offset, sizeof(text) - offset, "Paese: %.2s\n", ap.record.country);
+        offset += snprintf(text + offset, sizeof(text) - offset, "Paese: %.2s\n", ap.record.country);
+    }
+
+    // Handshake status for this network (the whole point of the capture, shown under the clients).
+    if (hsPresent) {
+        offset += snprintf(text + offset, sizeof(text) - offset, "Handshake: %s%s%s%s%s%s\n",
+            hsHas[0] ? "M1 " : "", hsHas[1] ? "M2 " : "", hsHas[2] ? "M3 " : "", hsHas[3] ? "M4 " : "",
+            hsPmkid ? "+PMKID " : "", hsSaved ? "-> salvato su SD" : "(parziale)");
+    } else {
+        offset += snprintf(text + offset, sizeof(text) - offset,
+            "Handshake: nessuno (in cattura, serve che un client si (ri)connetta)\n");
     }
     lv_label_set_text(ctx->detailInfo, text);
 
@@ -1257,8 +1447,10 @@ void updateViews(Context* ctx) {
             snprintf(status, sizeof(status), "Wi-Fi spento, lo accendo...");
         } else if (mode == RadioMode::Capture) {
 #ifdef ESP_PLATFORM
-            snprintf(status, sizeof(status), "Cattura: canale %d - %u reti, %u client",
-                g_hopChannel.load(), (unsigned)aps.size(), (unsigned)clientCount);
+            int hs = 0, pmkid = 0;
+            if (ctx->mutex.lock(0)) { hs = ctx->handshakesSaved; pmkid = ctx->pmkidSeen; ctx->mutex.unlock(); }
+            snprintf(status, sizeof(status), "ch%d - %u reti, %u cli - HS:%d PMKID:%d",
+                g_hopChannel.load(), (unsigned)aps.size(), (unsigned)clientCount, hs, pmkid);
 #else
             snprintf(status, sizeof(status), "Cattura non disponibile in questo ambiente");
 #endif
@@ -1305,6 +1497,8 @@ void onTimer(Context* ctx) {
         // capture, and disturb the handshake while a connection is being set up.
         service::wifi::scan();
     }
+
+    if (mode == RadioMode::Capture) flushHandshakes(ctx); // write any ready handshake to SD
 
     // Checked by window id, not app_scheduler_current_app_id(): this timer callback doesn't run
     // on the app's own task, so there is no "current app" thread-local to read here.
