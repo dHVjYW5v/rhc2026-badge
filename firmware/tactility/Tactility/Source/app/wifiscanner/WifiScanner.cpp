@@ -59,7 +59,8 @@ const uint32_t SERIES_COLORS[MAX_SERIES] = {
     0xE6194B, 0x3CB44B, 0xFFE119, 0x4363D8, 0xF58231, 0x911EB4, 0x42D4F4, 0xF032E6
 };
 
-enum class Page { Graph, List, Detail };
+enum class Page { Graph, List, Detail, Clients };
+enum class RadioMode { Stopped, ActiveScan, Capture };
 
 uint64_t bssidKey(const uint8_t* bssid) {
     uint64_t key = 0;
@@ -103,7 +104,7 @@ struct Context {
     std::map<uint64_t, CapturedClient> clients;
     std::vector<uint64_t> visible; // sorted by RSSI, rebuilt each refresh
     uint64_t selectedKey = 0;
-    bool capturing = false;
+    RadioMode mode = RadioMode::ActiveScan;
 
     lv_obj_t* toolbar = nullptr;
     lv_obj_t* statusLabel = nullptr;
@@ -112,7 +113,8 @@ struct Context {
     lv_obj_t* chart = nullptr;
     lv_obj_t* labelLayer = nullptr;
     lv_chart_series_t* series[MAX_SERIES] = {};
-    lv_obj_t* startButton = nullptr;
+    lv_obj_t* scanButton = nullptr;
+    lv_obj_t* captureButton = nullptr;
     lv_obj_t* stopButton = nullptr;
 
     lv_obj_t* listPage = nullptr;
@@ -125,6 +127,10 @@ struct Context {
     lv_obj_t* detailChart = nullptr;
     lv_chart_series_t* detailSeries[MAX_SERIES + 1] = {};
     lv_obj_t* connectButton = nullptr;
+
+    lv_obj_t* clientsPage = nullptr;
+    lv_obj_t* clientsList = nullptr;
+    std::map<uint64_t, lv_obj_t*> clientRows;
 };
 
 // ---- Capture engine (ESP32 only - passive sniffing needs direct esp_wifi access) ----
@@ -554,27 +560,56 @@ void onShowList(lv_event_t* event) {
     showPage(static_cast<Context*>(lv_event_get_user_data(event)), Page::List);
 }
 
-void onStartCapture(lv_event_t* event) {
-    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    startCapture(ctx);
+/** Reflects ctx->mode on the three mode buttons: each is disabled while it's the active mode. */
+void refreshModeButtons(Context* ctx) {
+    RadioMode mode;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
-        ctx->capturing = true;
+        mode = ctx->mode;
         ctx->mutex.unlock();
+    } else {
+        return;
     }
-    if (ctx->startButton != nullptr) lv_obj_add_state(ctx->startButton, LV_STATE_DISABLED);
-    if (ctx->stopButton != nullptr) lv_obj_remove_state(ctx->stopButton, LV_STATE_DISABLED);
+    if (ctx->scanButton != nullptr) {
+        if (mode == RadioMode::ActiveScan) lv_obj_add_state(ctx->scanButton, LV_STATE_DISABLED);
+        else lv_obj_remove_state(ctx->scanButton, LV_STATE_DISABLED);
+    }
+    if (ctx->captureButton != nullptr) {
+        if (mode == RadioMode::Capture || !isCaptureSupported()) lv_obj_add_state(ctx->captureButton, LV_STATE_DISABLED);
+        else lv_obj_remove_state(ctx->captureButton, LV_STATE_DISABLED);
+    }
+    if (ctx->stopButton != nullptr) {
+        if (mode == RadioMode::Stopped) lv_obj_add_state(ctx->stopButton, LV_STATE_DISABLED);
+        else lv_obj_remove_state(ctx->stopButton, LV_STATE_DISABLED);
+    }
 }
 
-void onStopCapture(lv_event_t* event) {
-    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    stopCapture(ctx);
+void setMode(Context* ctx, RadioMode mode) {
+    RadioMode previous;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
-        ctx->capturing = false;
+        previous = ctx->mode;
+        ctx->mode = mode;
         ctx->mutex.unlock();
+    } else {
+        return;
     }
-    if (ctx->startButton != nullptr) lv_obj_remove_state(ctx->startButton, LV_STATE_DISABLED);
-    if (ctx->stopButton != nullptr) lv_obj_add_state(ctx->stopButton, LV_STATE_DISABLED);
+    if (previous == RadioMode::Capture && mode != RadioMode::Capture) stopCapture(ctx);
+    if (mode == RadioMode::Capture) startCapture(ctx);
+    refreshModeButtons(ctx);
 }
+
+void onStartScan(lv_event_t* event) {
+    setMode(static_cast<Context*>(lv_event_get_user_data(event)), RadioMode::ActiveScan);
+}
+
+void onStartCapture(lv_event_t* event) {
+    setMode(static_cast<Context*>(lv_event_get_user_data(event)), RadioMode::Capture);
+}
+
+void onStop(lv_event_t* event) {
+    setMode(static_cast<Context*>(lv_event_get_user_data(event)), RadioMode::Stopped);
+}
+
+void onShowClients(lv_event_t* event);
 
 // ---- List page ----
 
@@ -588,7 +623,7 @@ void onSelectFromList(lv_event_t* event) {
     showPage(ctx, Page::Detail);
 }
 
-constexpr int LIST_ROW_HEIGHT = 54;
+constexpr int LIST_ROW_HEIGHT = 68;
 constexpr int LIST_STATS_WIDTH = 74;
 
 lv_obj_t* createListRow(Context* ctx, uint64_t key) {
@@ -623,7 +658,7 @@ lv_obj_t* createListRow(Context* ctx, uint64_t key) {
     lv_obj_set_style_pad_all(stats, 0, 0);
     lv_obj_set_style_border_width(stats, 0, 0);
     lv_obj_remove_flag(stats, LV_OBJ_FLAG_SCROLLABLE);
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         auto* statLabel = lv_label_create(stats);
         lv_obj_set_width(statLabel, LV_PCT(100));
         lv_obj_set_style_text_align(statLabel, LV_TEXT_ALIGN_RIGHT, 0);
@@ -633,7 +668,7 @@ lv_obj_t* createListRow(Context* ctx, uint64_t key) {
 }
 
 /** Updates existing rows in place and adds/removes rows so the list doesn't rebuild under the cursor. */
-void updateRows(Context* ctx, const std::vector<SeenAp>& aps) {
+void updateRows(Context* ctx, const std::vector<SeenAp>& aps, const std::map<uint64_t, int>& clientCounts) {
     if (ctx->list == nullptr) return;
 
     std::vector<uint64_t> keys;
@@ -676,6 +711,12 @@ void updateRows(Context* ctx, const std::vector<SeenAp>& aps) {
         lv_label_set_text(lv_obj_get_child(stats, 0), channelText);
         lv_label_set_text(lv_obj_get_child(stats, 1), powerText);
         lv_label_set_text(lv_obj_get_child(stats, 2), authToString(ap.record.authentication_type));
+
+        auto countIt = clientCounts.find(key);
+        int count = countIt != clientCounts.end() ? countIt->second : 0;
+        char clientText[12] = "";
+        if (count > 0) snprintf(clientText, sizeof(clientText), "cli:%d", count);
+        lv_label_set_text(lv_obj_get_child(stats, 3), clientText);
     }
 
     // Re-order to match the sorted-by-RSSI list.
@@ -762,6 +803,95 @@ void updateDetail(Context* ctx) {
     }
 }
 
+// ---- Clients page (all devices seen by the passive capture, Kismet-style) ----
+
+constexpr int CLIENT_ROW_HEIGHT = 40;
+
+lv_obj_t* createClientRow(Context* ctx) {
+    auto* row = lv_obj_create(ctx->clientsList);
+    lv_obj_set_size(row, LV_PCT(100), CLIENT_ROW_HEIGHT);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(row, 2, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    auto* macLabel = lv_label_create(row);
+    lv_label_set_long_mode(macLabel, LV_LABEL_LONG_MODE_DOTS);
+
+    auto* infoLabel = lv_label_create(row);
+    lv_label_set_long_mode(infoLabel, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_style_text_color(infoLabel, lv_color_hex(0x808080), 0);
+
+    return row;
+}
+
+void updateClientsPage(Context* ctx) {
+    if (ctx->clientsList == nullptr) return;
+
+    struct Row { uint64_t key; std::string mac; std::string info; };
+    std::vector<Row> clientRows2;
+    if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
+        uint64_t now = nowMs();
+        for (auto it = ctx->clients.begin(); it != ctx->clients.end();) {
+            if (now - it->second.lastSeenMs > ROW_EXPIRY_MS) {
+                it = ctx->clients.erase(it);
+                continue;
+            }
+            const auto& client = it->second;
+            bool randomMac = (client.mac[0] & 0x02) != 0;
+            const char* vendor = randomMac ? nullptr : lookupVendor(client.mac);
+
+            std::string assoc = "non associato";
+            if (client.associatedBssid != 0) {
+                auto apIt = ctx->seen.find(client.associatedBssid);
+                assoc = "assoc: " + std::string(apIt != ctx->seen.end() ? displaySsid(apIt->second.record) : "?");
+            }
+            std::string probes;
+            for (const auto& ssid : client.probedSsids) {
+                if (!probes.empty()) probes += ", ";
+                probes += ssid;
+            }
+
+            std::string mac = macToString(client.mac) + (randomMac ? " (MAC casuale)" : "");
+            if (vendor != nullptr) mac += std::string(" - ") + vendor;
+            std::string info = assoc + (probes.empty() ? "" : " | sonda: " + probes) +
+                " | " + std::to_string(client.lastRssi) + " dBm";
+
+            clientRows2.push_back({it->first, mac, info});
+            ++it;
+        }
+        ctx->mutex.unlock();
+    }
+
+    std::sort(clientRows2.begin(), clientRows2.end(), [](const Row& a, const Row& b) { return a.key < b.key; });
+
+    std::vector<uint64_t> keys;
+    for (const auto& row : clientRows2) keys.push_back(row.key);
+    for (auto it = ctx->clientRows.begin(); it != ctx->clientRows.end();) {
+        if (std::find(keys.begin(), keys.end(), it->first) == keys.end()) {
+            lv_obj_delete(it->second);
+            it = ctx->clientRows.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (const auto& row : clientRows2) {
+        lv_obj_t* widget;
+        auto it = ctx->clientRows.find(row.key);
+        if (it == ctx->clientRows.end()) {
+            widget = createClientRow(ctx);
+            ctx->clientRows[row.key] = widget;
+        } else {
+            widget = it->second;
+        }
+        lv_label_set_text(lv_obj_get_child(widget, 0), row.mac.c_str());
+        lv_label_set_text(lv_obj_get_child(widget, 1), row.info.c_str());
+    }
+    for (size_t i = 0; i < keys.size(); i++) {
+        lv_obj_move_to_index(ctx->clientRows[keys[i]], (int32_t)i);
+    }
+}
+
 // ---- Page switching / toolbar back handling ----
 
 void onHardwareBack(void* userData);
@@ -779,6 +909,7 @@ void showPage(Context* ctx, Page page) {
     lv_obj_add_flag(ctx->graphPage, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ctx->listPage, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ctx->detailPage, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ctx->clientsPage, LV_OBJ_FLAG_HIDDEN);
 
     switch (page) {
         case Page::Graph:
@@ -793,6 +924,11 @@ void showPage(Context* ctx, Page page) {
             lv_obj_remove_flag(ctx->detailPage, LV_OBJ_FLAG_HIDDEN);
             setTitle(ctx, "Dettaglio rete");
             updateDetail(ctx);
+            break;
+        case Page::Clients:
+            lv_obj_remove_flag(ctx->clientsPage, LV_OBJ_FLAG_HIDDEN);
+            setTitle(ctx, "Client rilevati");
+            updateClientsPage(ctx);
             break;
     }
 
@@ -810,6 +946,11 @@ void goBack(Context* ctx) {
     }
     if (current == Page::Detail) showPage(ctx, Page::List);
     else if (current == Page::List) showPage(ctx, Page::Graph);
+    else if (current == Page::Clients) showPage(ctx, Page::Graph);
+}
+
+void onShowClients(lv_event_t* event) {
+    showPage(static_cast<Context*>(lv_event_get_user_data(event)), Page::Clients);
 }
 
 void onHardwareBack(void* userData) {
@@ -835,27 +976,35 @@ void onBackPressed(lv_event_t* event) {
 // ---- Periodic refresh ----
 
 void updateViews(Context* ctx) {
-    auto activeResults = service::wifi::getScanResults();
-    bool capturing = false;
-
+    RadioMode mode;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
-        mergeActiveScan(ctx, activeResults);
-        capturing = ctx->capturing;
+        mode = ctx->mode;
         ctx->mutex.unlock();
     } else {
         return;
     }
 
+    // Stopped means frozen: keep whatever is already on screen, don't touch ctx->seen/clients.
+    if (mode == RadioMode::Stopped) return;
+
+    if (mode == RadioMode::ActiveScan) {
+        auto activeResults = service::wifi::getScanResults();
+        if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
+            mergeActiveScan(ctx, activeResults);
+            ctx->mutex.unlock();
+        }
+    }
+
     std::vector<SeenAp> aps;
+    std::map<uint64_t, int> clientCounts;
+    size_t clientCount = 0;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
         aps = sortedByRssi(ctx);
         ctx->visible.clear();
         for (const auto& ap : aps) ctx->visible.push_back(bssidKey(ap.record.bssid));
-        ctx->mutex.unlock();
-    }
-
-    size_t clientCount = 0;
-    if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
+        for (const auto& [clientKey, client] : ctx->clients) {
+            if (client.associatedBssid != 0) clientCounts[client.associatedBssid]++;
+        }
         clientCount = ctx->clients.size();
         ctx->mutex.unlock();
     }
@@ -865,7 +1014,7 @@ void updateViews(Context* ctx) {
         char status[80];
         if (!isRadioUsable()) {
             snprintf(status, sizeof(status), "Wi-Fi spento, lo accendo...");
-        } else if (capturing) {
+        } else if (mode == RadioMode::Capture) {
 #ifdef ESP_PLATFORM
             snprintf(status, sizeof(status), "Cattura: canale %d - %u reti, %u client",
                 g_hopChannel.load(), (unsigned)aps.size(), (unsigned)clientCount);
@@ -889,25 +1038,28 @@ void updateViews(Context* ctx) {
     }
 
     if (page == Page::Graph) updateGraph(ctx, aps);
-    else if (page == Page::List) updateRows(ctx, aps);
+    else if (page == Page::List) updateRows(ctx, aps, clientCounts);
     else if (page == Page::Detail) updateDetail(ctx);
+    else if (page == Page::Clients) updateClientsPage(ctx);
     lvgl_unlock();
 }
 
 void onTimer(Context* ctx) {
     using enum service::wifi::RadioState;
     auto state = service::wifi::getRadioState();
-    bool capturing = false;
+    RadioMode mode;
     if (ctx->mutex.lock(0)) {
-        capturing = ctx->capturing;
+        mode = ctx->mode;
         ctx->mutex.unlock();
+    } else {
+        return;
     }
 
-    if (state == Off) {
+    if (state == Off && mode != RadioMode::Stopped) {
         service::wifi::setEnabled(true);
-    } else if (!capturing && (state == On || state == ConnectionActive) && !service::wifi::isScanning()) {
-        // No active scan while capturing: it would fight the hopping task for the radio, and
-        // no scan while a connection is being set up, since that would disturb the handshake.
+    } else if (mode == RadioMode::ActiveScan && (state == On || state == ConnectionActive) && !service::wifi::isScanning()) {
+        // Only in active-scan mode: a scan would fight the hopping task for the radio during
+        // capture, and disturb the handshake while a connection is being set up.
         service::wifi::scan();
     }
 
@@ -1029,11 +1181,12 @@ void createGraphPage(Context* ctx, lv_obj_t* parent) {
     lv_obj_set_style_border_width(rightColumn, 0, 0);
     lv_obj_remove_flag(rightColumn, LV_OBJ_FLAG_SCROLLABLE);
 
-    ctx->startButton = createIconButton(rightColumn, LV_SYMBOL_PLAY, onStartCapture, ctx);
-    ctx->stopButton = createIconButton(rightColumn, LV_SYMBOL_STOP, onStopCapture, ctx);
-    lv_obj_add_state(ctx->stopButton, LV_STATE_DISABLED);
-    if (!isCaptureSupported()) lv_obj_add_state(ctx->startButton, LV_STATE_DISABLED);
+    // Scansione attiva (come la vecchia app) / cattura passiva con salto canale / ferma tutto.
+    ctx->scanButton = createIconButton(rightColumn, LV_SYMBOL_REFRESH, onStartScan, ctx);
+    ctx->captureButton = createIconButton(rightColumn, LV_SYMBOL_EYE_OPEN, onStartCapture, ctx);
+    ctx->stopButton = createIconButton(rightColumn, LV_SYMBOL_STOP, onStop, ctx);
     createIconButton(rightColumn, LV_SYMBOL_LIST, onShowList, ctx);
+    refreshModeButtons(ctx);
 }
 
 void createListPage(Context* ctx, lv_obj_t* parent) {
@@ -1079,6 +1232,18 @@ void createDetailPage(Context* ctx, lv_obj_t* parent) {
     lv_obj_add_event_cb(ctx->connectButton, onConnectPressed, LV_EVENT_SHORT_CLICKED, ctx);
 }
 
+void createClientsPage(Context* ctx, lv_obj_t* parent) {
+    ctx->clientsPage = createPage(parent);
+    lv_obj_add_flag(ctx->clientsPage, LV_OBJ_FLAG_HIDDEN);
+
+    ctx->clientsList = lv_obj_create(ctx->clientsPage);
+    lv_obj_set_size(ctx->clientsList, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_flex_flow(ctx->clientsList, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->clientsList, 2, 0);
+    lv_obj_set_scroll_dir(ctx->clientsList, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(ctx->clientsList, LV_SCROLLBAR_MODE_AUTO);
+}
+
 void createWidgets(lv_obj_t* parent, void* userData) {
     auto* ctx = static_cast<Context*>(userData);
 
@@ -1087,6 +1252,7 @@ void createWidgets(lv_obj_t* parent, void* userData) {
 
     ctx->toolbar = lvgl_toolbar_create(parent, "Wi-Fi Scanner");
     lvgl_toolbar_set_nav_action(ctx->toolbar, LV_SYMBOL_CLOSE, onBackPressed, ctx);
+    lvgl_toolbar_add_text_button_action(ctx->toolbar, "Client", onShowClients, ctx);
 
     auto* wrapper = lv_obj_create(parent);
     lv_obj_set_flex_flow(wrapper, LV_FLEX_FLOW_COLUMN);
@@ -1097,6 +1263,7 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     createGraphPage(ctx, wrapper);
     createListPage(ctx, wrapper);
     createDetailPage(ctx, wrapper);
+    createClientsPage(ctx, wrapper);
 
     showPage(ctx, ctx->page);
 }
@@ -1110,7 +1277,8 @@ void destroyWidgets(void* userData) {
     ctx->chart = nullptr;
     ctx->labelLayer = nullptr;
     for (auto& series : ctx->series) series = nullptr;
-    ctx->startButton = nullptr;
+    ctx->scanButton = nullptr;
+    ctx->captureButton = nullptr;
     ctx->stopButton = nullptr;
     ctx->listPage = nullptr;
     ctx->list = nullptr;
@@ -1121,6 +1289,9 @@ void destroyWidgets(void* userData) {
     ctx->detailChart = nullptr;
     for (auto& series : ctx->detailSeries) series = nullptr;
     ctx->connectButton = nullptr;
+    ctx->clientsPage = nullptr;
+    ctx->clientsList = nullptr;
+    ctx->clientRows.clear();
 }
 
 int32_t appMain(int /*argc*/, char* /*argv*/[]) {
