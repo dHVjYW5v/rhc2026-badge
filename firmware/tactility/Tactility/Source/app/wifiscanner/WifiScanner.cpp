@@ -518,6 +518,7 @@ void updateGraph(Context* ctx, const std::vector<SeenAp>& aps) {
 
     lv_obj_clean(ctx->labelLayer);
     int chartWidth = lv_obj_get_width(ctx->chart);
+    int chartHeight = lv_obj_get_height(ctx->chart);
 
     int used = 0;
     for (const auto& ap : aps) {
@@ -527,20 +528,28 @@ void updateGraph(Context* ctx, const std::vector<SeenAp>& aps) {
         fillBell(ctx->chart, ctx->series[used], ap.record.channel, ap.record.rssi);
         lv_chart_hide_series(ctx->chart, ctx->series[used], false);
 
-        // The name sits centered on its own bell's peak. A channel's peak is at (channel+1)/16
-        // of the plot width - the same fraction createAxisLabels uses for the channel numbers,
-        // so the name lines up over its bell. Names on nearby channels may overlap: that's
-        // accepted, keeping each name on its own curve as before.
         auto* label = lv_label_create(ctx->labelLayer);
         lv_label_set_text(label, displaySsid(ap.record));
         lv_obj_set_style_text_color(label, lv_color_hex(SERIES_COLORS[used]), 0);
         lv_obj_update_layout(label);
         int width = lv_obj_get_width(label);
+        int height = lv_obj_get_height(label);
+
+        // X: centered on the bell's peak. A channel's peak is at (channel+1)/16 of the plot width
+        // (same fraction createAxisLabels uses for the channel numbers).
         int xPx = chartWidth * (ap.record.channel + 1) / 16 - width / 2;
         if (xPx < 0) xPx = 0;
         if (xPx + width > chartWidth) xPx = chartWidth - width;
-        lv_obj_set_x(label, xPx);
-        lv_obj_set_y(label, 2 + (used % 3) * 16); // stagger a little vertically so overlaps stay readable
+
+        // Y: just above the peak, so each name sits on its own curve inside the chart. The peak
+        // height mirrors fillBell: clamp(rssi - floor, 1, range), with y=0 at the top of the chart.
+        int32_t peak = std::clamp<int32_t>(ap.record.rssi - SIGNAL_FLOOR_DBM, 1, SIGNAL_RANGE_DB);
+        int yPx = chartHeight - (chartHeight * peak / SIGNAL_RANGE_DB);
+        yPx -= height; // sit the text just above the peak instead of on top of it
+        if (yPx < 0) yPx = 0;
+        if (yPx + height > chartHeight) yPx = chartHeight - height;
+
+        lv_obj_set_pos(label, xPx, yPx);
         used++;
     }
     for (int i = used; i < MAX_SERIES; i++) {
