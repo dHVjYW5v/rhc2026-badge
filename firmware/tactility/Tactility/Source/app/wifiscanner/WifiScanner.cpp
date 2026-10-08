@@ -104,6 +104,7 @@ struct Context {
     std::map<uint64_t, CapturedClient> clients;
     std::vector<uint64_t> visible; // sorted by RSSI, rebuilt each refresh
     uint64_t selectedKey = 0;
+    uint32_t detailBeaconBaseline = 0;
     RadioMode mode = RadioMode::ActiveScan;
 
     lv_obj_t* toolbar = nullptr;
@@ -124,8 +125,6 @@ struct Context {
     lv_obj_t* detailPage = nullptr;
     lv_obj_t* detailInfo = nullptr;
     lv_obj_t* detailClients = nullptr;
-    lv_obj_t* detailChart = nullptr;
-    lv_chart_series_t* detailSeries[MAX_SERIES + 1] = {};
     lv_obj_t* connectButton = nullptr;
 
     lv_obj_t* clientsPage = nullptr;
@@ -629,6 +628,9 @@ void onSelectFromList(lv_event_t* event) {
     auto key = reinterpret_cast<uint64_t>(lv_obj_get_user_data(lv_event_get_target_obj(event)));
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
         ctx->selectedKey = key;
+        // Baseline for the "beacon since you opened this" counter.
+        auto it = ctx->seen.find(key);
+        ctx->detailBeaconBaseline = it != ctx->seen.end() ? it->second.packetCount : 0;
         ctx->mutex.unlock();
     }
     showPage(ctx, Page::Detail);
@@ -745,12 +747,14 @@ void updateDetail(Context* ctx) {
 
     SeenAp ap{};
     bool found = false;
+    uint32_t beaconBaseline = 0;
     std::vector<CapturedClient> relatedClients;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
         auto it = ctx->seen.find(ctx->selectedKey);
         if (it != ctx->seen.end()) {
             ap = it->second;
             found = true;
+            beaconBaseline = ctx->detailBeaconBaseline;
             for (const auto& [clientKey, client] : ctx->clients) {
                 if (client.associatedBssid == ctx->selectedKey) relatedClients.push_back(client);
             }
@@ -761,23 +765,36 @@ void updateDetail(Context* ctx) {
 
     uint64_t now = nowMs();
     const char* vendor = lookupVendor(ap.record.bssid);
+    uint32_t beaconsSinceOpen = ap.packetCount >= beaconBaseline ? ap.packetCount - beaconBaseline : 0;
+
     char text[768];
     int offset = snprintf(text, sizeof(text),
         "SSID: %s\n"
         "MAC: %s (%s)\n"
-        "Sicurezza: %s\n"
-        "Cifratura: %s\n"
+        "Sicurezza: %s\n",
+        displaySsid(ap.record), macToString(ap.record.bssid).c_str(),
+        vendor != nullptr ? vendor : "fornitore sconosciuto",
+        authToString(ap.record.authentication_type));
+
+    // The passive capture can only guess the cipher from beacon IEs, so show the exact cipher
+    // only for networks the active scan actually measured.
+    if (!ap.fromCapture) {
+        offset += snprintf(text + offset, sizeof(text) - offset, "Cifratura: %s\n",
+            cipherToString(ap.record.pairwise_cipher));
+    }
+
+    offset += snprintf(text + offset, sizeof(text) - offset,
         "Canale: %d (%d MHz)\n"
         "Potenza: %d dBm (min %d / max %d)\n"
         "Distanza stimata: %.1f m\n"
         "PHY: %s\n"
         "Fonte: %s\n"
+        "Beacon ricevuti (da apertura): %u\n"
         "Visto da %u s, ultimo %u s fa\n",
-        displaySsid(ap.record), macToString(ap.record.bssid).c_str(), vendor != nullptr ? vendor : "fornitore sconosciuto",
-        authToString(ap.record.authentication_type), cipherToString(ap.record.pairwise_cipher),
         (int)ap.record.channel, frequencyMhz((int)ap.record.channel),
         (int)ap.record.rssi, (int)ap.rssiMin, (int)ap.rssiMax, estimateDistanceMeters(ap.record.rssi),
         phyToString(ap.record.phy_flags).c_str(), ap.fromCapture ? "cattura passiva" : "scansione attiva",
+        (unsigned)beaconsSinceOpen,
         (unsigned)((now - ap.firstSeenMs) / 1000), (unsigned)((now - ap.lastSeenMs) / 1000));
 
     if (ap.record.country[0] != '\0') {
@@ -787,21 +804,17 @@ void updateDetail(Context* ctx) {
 
     if (ctx->detailClients != nullptr) {
         if (relatedClients.empty()) {
-            lv_label_set_text(ctx->detailClients, "Nessun client rilevato dalla cattura.");
+            lv_label_set_text(ctx->detailClients, "Client associati: nessuno rilevato dalla cattura.");
         } else {
-            std::string clientText = "Client visti (cattura passiva):\n";
+            std::string clientText = "Client associati (cattura passiva):\n";
             for (const auto& client : relatedClients) {
                 bool randomMac = (client.mac[0] & 0x02) != 0;
                 clientText += "- " + macToString(client.mac) + (randomMac ? " (MAC casuale)" : "") +
-                    ", " + std::to_string(client.lastRssi) + " dBm\n";
+                    ", " + std::to_string(client.lastRssi) + " dBm, " +
+                    std::to_string(client.packetCount) + " frame\n";
             }
             lv_label_set_text(ctx->detailClients, clientText.c_str());
         }
-    }
-
-    if (ctx->detailChart != nullptr) {
-        fillBell(ctx->detailChart, ctx->detailSeries[0], (int)ap.record.channel, ap.record.rssi);
-        lv_chart_hide_series(ctx->detailChart, ctx->detailSeries[0], false);
     }
 }
 
@@ -1213,16 +1226,6 @@ void createDetailPage(Context* ctx, lv_obj_t* parent) {
     lv_obj_add_flag(ctx->detailPage, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_style_pad_all(ctx->detailPage, 4, 0);
 
-    // Inverted-bell chart highlighting this network, fixed at the top so it stays visible.
-    ctx->detailChart = lv_chart_create(ctx->detailPage);
-    lv_obj_set_size(ctx->detailChart, LV_PCT(100), 60);
-    lv_chart_set_type(ctx->detailChart, LV_CHART_TYPE_LINE);
-    lv_chart_set_point_count(ctx->detailChart, CHART_POINTS);
-    lv_chart_set_axis_range(ctx->detailChart, LV_CHART_AXIS_PRIMARY_Y, 0, SIGNAL_RANGE_DB);
-    lv_obj_set_style_size(ctx->detailChart, 0, 0, LV_PART_INDICATOR);
-    lv_obj_remove_flag(ctx->detailChart, LV_OBJ_FLAG_SCROLLABLE);
-    ctx->detailSeries[0] = lv_chart_add_series(ctx->detailChart, lv_color_hex(SERIES_COLORS[0]), LV_CHART_AXIS_PRIMARY_Y);
-
     // The text and the Connect button live in an lv_list so the page scrolls with the badge keys
     // (focusing the Connect button at the bottom drags the list up to reveal everything).
     auto* scroll = lv_list_create(ctx->detailPage);
@@ -1291,8 +1294,6 @@ void destroyWidgets(void* userData) {
     ctx->detailPage = nullptr;
     ctx->detailInfo = nullptr;
     ctx->detailClients = nullptr;
-    ctx->detailChart = nullptr;
-    for (auto& series : ctx->detailSeries) series = nullptr;
     ctx->connectButton = nullptr;
     ctx->clientsPage = nullptr;
     ctx->clientsList = nullptr;
