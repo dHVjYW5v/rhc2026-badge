@@ -507,7 +507,9 @@ void fillBell(lv_obj_t* chart, lv_chart_series_t* series, int channel, int8_t rs
     for (int i = 0; i < CHART_POINTS; i++) {
         float x = CH_AXIS_MIN + step * i;
         float distance = std::fabs(x - (float)channel) / BELL_HALF_WIDTH;
-        values[i] = distance <= 1.0f ? (int32_t)(height * (1.0f - distance * distance)) : LV_CHART_POINT_NONE;
+        // 0 outside the bell (not POINT_NONE) so the curve sits on the zero baseline and the bell
+        // rises from it, instead of floating with gaps at the edges.
+        values[i] = distance < 1.0f ? (int32_t)(height * (1.0f - distance * distance)) : 0;
     }
     lv_chart_set_series_values(chart, series, values, CHART_POINTS);
 }
@@ -699,24 +701,21 @@ void updateGraph(Context* ctx, const std::vector<SeenAp>& aps) {
     int chartWidth = lv_obj_get_width(ctx->chart);
     int chartHeight = lv_obj_get_height(ctx->chart);
 
-    // Each chart series slot keeps a fixed colour (SERIES_COLORS[slot]). A network draws into the
-    // slot whose colour is its own stable colorIndex, so its bell and its list colour-bar match
-    // without needing to recolour series at runtime.
-    bool slotUsed[MAX_SERIES] = {};
-
+    // Draw the strongest networks into consecutive series slots (so none overwrite each other),
+    // recolouring each slot to that network's stable colour so its bell matches its list colour-bar.
     int drawn = 0;
     for (const auto& ap : aps) {
         if (drawn >= MAX_SERIES) break;
         if (ap.record.channel < 1 || ap.record.channel > 13) continue;
 
-        int slot = ap.colorIndex % MAX_SERIES;
-        fillBell(ctx->chart, ctx->series[slot], ap.record.channel, ap.record.rssi);
-        lv_chart_hide_series(ctx->chart, ctx->series[slot], false);
-        slotUsed[slot] = true;
+        uint32_t color = SERIES_COLORS[ap.colorIndex % MAX_SERIES];
+        lv_chart_set_series_color(ctx->chart, ctx->series[drawn], lv_color_hex(color));
+        fillBell(ctx->chart, ctx->series[drawn], ap.record.channel, ap.record.rssi);
+        lv_chart_hide_series(ctx->chart, ctx->series[drawn], false);
 
         auto* label = lv_label_create(ctx->labelLayer);
         lv_label_set_text(label, displaySsid(ap.record));
-        lv_obj_set_style_text_color(label, lv_color_hex(SERIES_COLORS[slot]), 0);
+        lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
         lv_obj_update_layout(label);
         int width = lv_obj_get_width(label);
         int height = lv_obj_get_height(label);
@@ -737,8 +736,8 @@ void updateGraph(Context* ctx, const std::vector<SeenAp>& aps) {
         lv_obj_set_pos(label, xPx, yPx);
         drawn++;
     }
-    for (int i = 0; i < MAX_SERIES; i++) {
-        if (!slotUsed[i]) lv_chart_hide_series(ctx->chart, ctx->series[i], true);
+    for (int i = drawn; i < MAX_SERIES; i++) {
+        lv_chart_hide_series(ctx->chart, ctx->series[i], true);
     }
 }
 
@@ -915,13 +914,14 @@ void updateRows(Context* ctx, const std::vector<SeenAp>& aps, const std::map<uin
         snprintf(ssidLine, sizeof(ssidLine), "%s%s", displaySsid(ap.record), ap.fromCapture ? " *" : "");
         lv_label_set_text(lv_obj_get_child(row, 1), ssidLine);
 
-        // Plain numbers only; the legend header above the list says what each column is.
+        // Plain numbers only; the legend header above the list says what each column is. The middle
+        // column shows total beacons/frames seen for this network (dBm is in the detail instead).
         char channelText[16];
-        char powerText[16];
+        char beaconText[16];
         snprintf(channelText, sizeof(channelText), "%d", (int)ap.record.channel);
-        snprintf(powerText, sizeof(powerText), "%d", (int)ap.record.rssi);
+        snprintf(beaconText, sizeof(beaconText), "%u", (unsigned)ap.packetCount);
         lv_label_set_text(lv_obj_get_child(row, 2), channelText);
-        lv_label_set_text(lv_obj_get_child(row, 3), powerText);
+        lv_label_set_text(lv_obj_get_child(row, 3), beaconText);
         lv_label_set_text(lv_obj_get_child(row, 4), authToString(ap.record.authentication_type));
 
         auto countIt = clientCounts.find(key);
@@ -1226,10 +1226,15 @@ void updateViews(Context* ctx) {
         aps = sortedByRssi(ctx);
         ctx->visible.clear();
         for (const auto& ap : aps) ctx->visible.push_back(bssidKey(ap.record.bssid));
+        // Count only clients still active (seen within the expiry window), so the per-network
+        // count goes down again when a client goes quiet instead of only ever growing.
+        uint64_t now = nowMs();
         for (const auto& [clientKey, client] : ctx->clients) {
-            if (client.associatedBssid != 0) clientCounts[client.associatedBssid]++;
+            if (client.associatedBssid != 0 && now - client.lastSeenMs <= ROW_EXPIRY_MS) {
+                clientCounts[client.associatedBssid]++;
+                clientCount++;
+            }
         }
-        clientCount = ctx->clients.size();
         ctx->mutex.unlock();
     }
 
@@ -1481,7 +1486,7 @@ void createListPage(Context* ctx, lv_obj_t* parent) {
     lv_label_set_text(nameHdr, "Rete");
     lv_obj_set_flex_grow(nameHdr, 1);
     addLegendLabel(header, "ch", COL_CH);
-    addLegendLabel(header, "dBm", COL_POWER);
+    addLegendLabel(header, "bcn", COL_POWER);
     addLegendLabel(header, "sec", COL_SEC);
     addLegendLabel(header, "cli", COL_CLI);
 
