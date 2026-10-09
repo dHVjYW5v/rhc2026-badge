@@ -502,6 +502,9 @@ void startCapture(Context* ctx) {
     if (g_captureRunning.load()) return;
     g_captureCtx.store(ctx);
     g_captureStopped.store(false);
+    // 0 is not a valid Wi-Fi channel - keeps sendDeauthBurstOnChannel()'s wait from matching a
+    // stale value left over from a previous capture before hopTask has set a real one.
+    g_hopChannel.store(0);
     g_captureRunning.store(true);
     xTaskCreatePinnedToCore(
         [](void* arg) { hopTask(arg); },
@@ -523,6 +526,10 @@ bool isCaptureSupported() { return true; }
 
 void setCaptureLockChannel(int ch) { g_lockChannel.store(ch); }
 int getCaptureLockChannel() { return g_lockChannel.load(); }
+// The channel the radio is actually sitting on right now - hopTask only re-reads the lock once
+// per HOP_INTERVAL_MS, so right after setCaptureLockChannel() this can still briefly be the old
+// (wrong) channel. Anything that transmits immediately (deauth) must wait for this to catch up.
+int getCurrentRadioChannel() { return g_hopChannel.load(); }
 
 // ---- Deauth (attack #2) ----
 
@@ -563,6 +570,19 @@ void sendDeauthBurst(const uint8_t* bssid, const uint8_t* client) {
         }
         vTaskDelay(pdMS_TO_TICKS(DEAUTH_FRAME_GAP_MS));
     }
+}
+
+/** setCaptureLockChannel() only posts the request - hopTask re-reads it once per
+ * HOP_INTERVAL_MS, so right after locking the radio can still briefly be sitting on the
+ * previous (wrong) channel. The whole burst (a couple hundred ms) is short enough to otherwise
+ * race past that window and go out on the wrong channel entirely, which is exactly what makes
+ * it silently do nothing. Wait for the radio to actually get there first (bounded, so a lock
+ * that somehow never lands - e.g. hopTask not running - can't hang this forever). */
+void sendDeauthBurstOnChannel(const uint8_t* bssid, int channel) {
+    for (int i = 0; i < 40 && getCurrentRadioChannel() != channel; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    sendDeauthBurst(bssid, nullptr);
 }
 
 // ---- .pcap writing (handshake export to SD) ----
@@ -617,7 +637,9 @@ void stopCapture(Context*) {}
 bool isCaptureSupported() { return false; }
 void setCaptureLockChannel(int) {}
 int getCaptureLockChannel() { return 0; }
+int getCurrentRadioChannel() { return 0; }
 void sendDeauthBurst(const uint8_t*, const uint8_t*) {}
+void sendDeauthBurstOnChannel(const uint8_t*, int) {}
 
 #endif // ESP_PLATFORM
 
@@ -2038,9 +2060,10 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
                             lvgl_unlock();
                         }
                         setCaptureLockChannel(channel);
-                        // Sending blocks this task for the burst's duration (a few hundred ms) -
-                        // fine, it's this app's own dedicated task, not the LVGL or timer task.
-                        sendDeauthBurst(bssid, nullptr);
+                        // Blocks this task briefly (waiting for the lock to actually take
+                        // effect, then the burst itself) - fine, it's this app's own dedicated
+                        // task, not the LVGL or timer task.
+                        sendDeauthBurstOnChannel(bssid, channel);
                         if (ctx.mutex.lock(250 / portTICK_PERIOD_MS)) {
                             ctx.deauthBurstsSent++;
                             ctx.mutex.unlock();
