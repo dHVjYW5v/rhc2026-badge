@@ -110,12 +110,32 @@ hashcat -m 22000 hash.22000 wordlist.txt
 aircrack-ng -w wordlist.txt capture.pcap
 ```
 
+## Deauthentication
+
+A network's detail page has a red **"Deauth"** button. It always asks for confirmation first
+(the dialog names the SSID) before sending anything. Once confirmed, it:
+
+1. starts capture and locks the radio onto that network's channel if it wasn't already
+   (same mechanism as targeted capture, for the same reason - off-channel frames go nowhere),
+2. sends a short, bounded burst (12 frames, ~25 ms apart - not a continuous flood) of spoofed
+   802.11 deauthentication frames (reason code 7, the same one `aireplay-ng` uses) addressed to
+   the broadcast address, so every client currently on that AP disconnects and reconnects.
+
+The channel stays locked afterward, so capture keeps running on that network and a resulting
+handshake (from the forced reconnect) is caught the same way as in **Handshake / PMKID
+capture** above - this is the main reason to use it: force a handshake instead of waiting for
+one. The detail page also shows a running count of bursts sent this session.
+
+This is a real, disruptive action (it briefly kicks every connected client off the network),
+unlike every other feature in this app which is purely passive/receive-only.
+
 ## Status
 
 | Attack | Status |
 | --- | --- |
 | Handshake / PMKID capture | ✅ Implemented |
-| Deauthentication | 🚧 Planned |
+| Deauthentication (broadcast, per-network) | ✅ Implemented |
+| Deauthentication (single targeted client) | 🚧 Planned |
 | Beacon spam / evil twin | 🚧 Planned |
 
 ## Restore point
