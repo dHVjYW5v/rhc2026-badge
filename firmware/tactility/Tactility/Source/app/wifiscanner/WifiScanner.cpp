@@ -193,6 +193,7 @@ struct Context {
     lv_obj_t* detailScroll = nullptr;
     lv_obj_t* detailInfo = nullptr;
     lv_obj_t* detailClientsButton = nullptr;
+    lv_obj_t* detailLockButton = nullptr;
     lv_obj_t* connectButton = nullptr;
 
     lv_obj_t* clientsPage = nullptr;
@@ -208,6 +209,9 @@ std::atomic<Context*> g_captureCtx{nullptr};
 std::atomic<bool> g_captureRunning{false};
 std::atomic<bool> g_captureStopped{true};
 std::atomic<int> g_hopChannel{1};
+// 0 = hop normally; 1..13 = park on that channel (targeted capture, so a handshake on that
+// AP isn't missed while the radio is off visiting other channels).
+std::atomic<int> g_lockChannel{0};
 
 /** Pulls the SSID (tag 0) and a WPA/WPA2/OPEN/WEP guess out of a beacon/probe-response's IEs.
  * No AKM parsing, so WPA3/SAE reads as WPA2 here - good enough to color the list, not a survey tool. */
@@ -468,8 +472,14 @@ int32_t hopTask(void* /*arg*/) {
 
     int i = 0;
     while (g_captureRunning.load()) {
-        int channel = HOP_SEQUENCE[i];
-        i = (i + 1) % HOP_SEQUENCE_LEN;
+        int lock = g_lockChannel.load();
+        int channel;
+        if (lock >= 1 && lock <= 13) {
+            channel = lock; // parked: stay put so M1..M4 of the handshake all land on us
+        } else {
+            channel = HOP_SEQUENCE[i];
+            i = (i + 1) % HOP_SEQUENCE_LEN;
+        }
         esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
         g_hopChannel.store(channel);
         vTaskDelay(pdMS_TO_TICKS(HOP_INTERVAL_MS));
@@ -494,6 +504,7 @@ void startCapture(Context* ctx) {
 
 void stopCapture(Context* ctx) {
     if (!g_captureRunning.load()) return;
+    g_lockChannel.store(0); // next capture starts hopping again, not parked
     g_captureRunning.store(false);
     for (int i = 0; i < 100 && !g_captureStopped.load(); i++) {
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -503,6 +514,9 @@ void stopCapture(Context* ctx) {
 }
 
 bool isCaptureSupported() { return true; }
+
+void setCaptureLockChannel(int ch) { g_lockChannel.store(ch); }
+int getCaptureLockChannel() { return g_lockChannel.load(); }
 
 // ---- .pcap writing (handshake export to SD) ----
 
@@ -554,6 +568,8 @@ bool savePcap(const HandshakeCapture& hc, uint64_t bssidKeyVal) {
 void startCapture(Context*) {}
 void stopCapture(Context*) {}
 bool isCaptureSupported() { return false; }
+void setCaptureLockChannel(int) {}
+int getCaptureLockChannel() { return 0; }
 
 #endif // ESP_PLATFORM
 
@@ -990,6 +1006,33 @@ void onStop(lv_event_t* event) {
     setMode(static_cast<Context*>(lv_event_get_user_data(event)), RadioMode::Stopped);
 }
 
+void updateDetail(Context* ctx);
+
+// "Cattura mirata": park the radio on the selected network's channel so a full 4-way handshake
+// (or PMKID) lands on us instead of being missed while hopping. Second tap releases the lock.
+void onToggleLock(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    int channel = 0;
+    if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
+        auto it = ctx->seen.find(ctx->selectedKey);
+        if (it != ctx->seen.end()) channel = it->second.record.channel;
+        ctx->mutex.unlock();
+    }
+    if (channel < 1 || channel > 13) return;
+
+    bool nowLocked = getCaptureLockChannel() != channel;
+    if (nowLocked) {
+        // Locking implies capturing: if we're only scanning (or stopped), switch to capture first
+        // so the hop task is actually running and able to park.
+        if (ctx->mode != RadioMode::Capture) setMode(ctx, RadioMode::Capture);
+        setCaptureLockChannel(channel);
+    } else {
+        setCaptureLockChannel(0); // release: resume hopping, still capturing
+    }
+    updateDetail(ctx);
+    updateLeds(ctx);
+}
+
 void onShowClients(lv_event_t* event);
 
 // ---- List page ----
@@ -1213,6 +1256,19 @@ void updateDetail(Context* ctx) {
         snprintf(buttonText, sizeof(buttonText), "Client associati (%d)", clientCount);
         lv_obj_t* label = lv_obj_get_child(ctx->detailClientsButton, lv_obj_get_child_count(ctx->detailClientsButton) - 1);
         if (label != nullptr) lv_label_set_text(label, buttonText);
+    }
+
+    // Lock button reflects whether we're parked on THIS network's channel.
+    if (ctx->detailLockButton != nullptr) {
+        bool lockedHere = getCaptureLockChannel() == (int)ap.record.channel && ap.record.channel >= 1;
+        char lockText[48];
+        if (lockedHere) {
+            snprintf(lockText, sizeof(lockText), "Cattura mirata ATTIVA (ch %d)", (int)ap.record.channel);
+        } else {
+            snprintf(lockText, sizeof(lockText), "Cattura mirata su ch %d", (int)ap.record.channel);
+        }
+        lv_obj_t* label = lv_obj_get_child(ctx->detailLockButton, lv_obj_get_child_count(ctx->detailLockButton) - 1);
+        if (label != nullptr) lv_label_set_text(label, lockText);
     }
 }
 
@@ -1449,8 +1505,14 @@ void updateViews(Context* ctx) {
 #ifdef ESP_PLATFORM
             int hs = 0, pmkid = 0;
             if (ctx->mutex.lock(0)) { hs = ctx->handshakesSaved; pmkid = ctx->pmkidSeen; ctx->mutex.unlock(); }
-            snprintf(status, sizeof(status), "ch%d - %u reti, %u cli - HS:%d PMKID:%d",
-                g_hopChannel.load(), (unsigned)aps.size(), (unsigned)clientCount, hs, pmkid);
+            int lock = g_lockChannel.load();
+            if (lock >= 1 && lock <= 13) {
+                snprintf(status, sizeof(status), "LOCK ch%d - %u reti, %u cli - HS:%d PMKID:%d",
+                    lock, (unsigned)aps.size(), (unsigned)clientCount, hs, pmkid);
+            } else {
+                snprintf(status, sizeof(status), "ch%d - %u reti, %u cli - HS:%d PMKID:%d",
+                    g_hopChannel.load(), (unsigned)aps.size(), (unsigned)clientCount, hs, pmkid);
+            }
 #else
             snprintf(status, sizeof(status), "Cattura non disponibile in questo ambiente");
 #endif
@@ -1734,6 +1796,11 @@ void createDetailPage(Context* ctx, lv_obj_t* parent) {
     ctx->detailClientsButton = lv_list_add_button(scroll, LV_SYMBOL_LIST, "Client associati (0)");
     lv_obj_add_event_cb(ctx->detailClientsButton, onShowClients, LV_EVENT_CLICKED, ctx);
 
+    if (isCaptureSupported()) {
+        ctx->detailLockButton = lv_list_add_button(scroll, LV_SYMBOL_GPS, "Cattura mirata");
+        lv_obj_add_event_cb(ctx->detailLockButton, onToggleLock, LV_EVENT_CLICKED, ctx);
+    }
+
     ctx->detailInfo = lv_label_create(scroll);
     lv_label_set_long_mode(ctx->detailInfo, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_width(ctx->detailInfo, LV_PCT(100));
@@ -1811,6 +1878,7 @@ void destroyWidgets(void* userData) {
     ctx->detailScroll = nullptr;
     ctx->detailInfo = nullptr;
     ctx->detailClientsButton = nullptr;
+    ctx->detailLockButton = nullptr;
     ctx->connectButton = nullptr;
     ctx->clientsPage = nullptr;
     ctx->clientsList = nullptr;
