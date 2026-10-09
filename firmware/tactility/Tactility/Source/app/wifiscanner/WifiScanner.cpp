@@ -559,7 +559,13 @@ void sendDeauthFrame(const uint8_t* addr1, const uint8_t* addr2, const uint8_t* 
     memcpy(frame + 4, addr1, 6);
     memcpy(frame + 10, addr2, 6);
     memcpy(frame + 16, bssid, 6);
-    esp_wifi_80211_tx(WIFI_IF_STA, frame, sizeof(frame), true);
+    // Nothing downstream ever looked at this - a driver-level failure (e.g. not yet past
+    // esp_wifi_start(), or a scan in progress) was silently swallowed, so there was no way to
+    // tell "frames go out but the client ignores them" apart from "frames never go out at all".
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, frame, sizeof(frame), true);
+    if (err != ESP_OK) {
+        LOG_W(TAG, "deauth: esp_wifi_80211_tx failed: %s", esp_err_to_name(err));
+    }
 }
 
 /** A short, bounded deauth burst for one AP - not a continuous flood. Forces one reconnect
@@ -568,6 +574,9 @@ void sendDeauthFrame(const uint8_t* addr1, const uint8_t* addr2, const uint8_t* 
  * direction, since a real client ignores a deauth that isn't addressed to it. */
 void sendDeauthBurst(const uint8_t* bssid, const uint8_t* client) {
     const uint8_t* target = (client != nullptr) ? client : BROADCAST_MAC;
+    LOG_I(TAG, "deauth: sending %d frames to %02x:%02x:%02x:%02x:%02x:%02x for AP %02x:%02x:%02x:%02x:%02x:%02x",
+        DEAUTH_BURST_COUNT, target[0], target[1], target[2], target[3], target[4], target[5],
+        bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
     for (int i = 0; i < DEAUTH_BURST_COUNT; i++) {
         sendDeauthFrame(target, bssid, bssid);
         if (client != nullptr) {
@@ -584,8 +593,16 @@ void sendDeauthBurst(const uint8_t* bssid, const uint8_t* client) {
  * it silently do nothing. Wait for the radio to actually get there first (bounded, so a lock
  * that somehow never lands - e.g. hopTask not running - can't hang this forever). */
 void sendDeauthBurstOnChannel(const uint8_t* bssid, int channel) {
-    for (int i = 0; i < 40 && getCurrentRadioChannel() != channel; i++) {
+    int i = 0;
+    for (; i < 40 && getCurrentRadioChannel() != channel; i++) {
         vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (i >= 40) {
+        // Sends anyway - better than silently doing nothing - but on the wrong channel this
+        // burst goes out into empty air, which looks identical to "deauth did nothing" from
+        // the outside. This is the one case worth knowing about from the serial log.
+        LOG_W(TAG, "deauth: radio never reached channel %d (stuck at %d) - sending anyway",
+            channel, getCurrentRadioChannel());
     }
     sendDeauthBurst(bssid, nullptr);
 }
