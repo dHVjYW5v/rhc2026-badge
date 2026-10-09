@@ -200,6 +200,7 @@ struct Context {
     lv_obj_t* detailClientsButton = nullptr;
     lv_obj_t* detailLockButton = nullptr;
     lv_obj_t* detailDeauthButton = nullptr;
+    lv_obj_t* detailHsSummary = nullptr; // compact "HS: x/4  PMKID: si/no" right under Deauth
     lv_obj_t* connectButton = nullptr;
 
     lv_obj_t* clientsPage = nullptr;
@@ -1351,6 +1352,16 @@ void updateDetail(Context* ctx) {
     }
     lv_label_set_text(ctx->detailInfo, text);
 
+    // Compact HS/PMKID count right under Deauth, so a glance tells you if it caught anything -
+    // the full M1..M4 breakdown above is still there for when you need the detail.
+    if (ctx->detailHsSummary != nullptr) {
+        int hsCount = (hsHas[0] ? 1 : 0) + (hsHas[1] ? 1 : 0) + (hsHas[2] ? 1 : 0) + (hsHas[3] ? 1 : 0);
+        char hsSummary[48];
+        snprintf(hsSummary, sizeof(hsSummary), "HS: %d/4%s   PMKID: %s",
+            hsCount, (hsPresent && hsSaved) ? " (salvato)" : "", hsPmkid ? "si" : "no");
+        lv_label_set_text(ctx->detailHsSummary, hsSummary);
+    }
+
     // Clients live on their own page now; the button just shows how many and opens it.
     if (ctx->detailClientsButton != nullptr) {
         char buttonText[32];
@@ -1906,6 +1917,12 @@ void createDetailPage(Context* ctx, lv_obj_t* parent) {
         lv_obj_set_style_bg_color(ctx->detailDeauthButton, lv_color_hex(0xB33A3A), 0);
         lv_obj_set_style_bg_opa(ctx->detailDeauthButton, LV_OPA_50, 0);
         lv_obj_add_event_cb(ctx->detailDeauthButton, onDeauthPressed, LV_EVENT_CLICKED, ctx);
+
+        // Right under Deauth, so you can tell at a glance whether it caught anything without
+        // scrolling down to the full "Handshake: ..." line.
+        ctx->detailHsSummary = lv_label_create(scroll);
+        lv_obj_set_width(ctx->detailHsSummary, LV_PCT(100));
+        lv_label_set_text(ctx->detailHsSummary, "HS: 0/4   PMKID: no");
     }
 
     ctx->detailInfo = lv_label_create(scroll);
@@ -1987,6 +2004,7 @@ void destroyWidgets(void* userData) {
     ctx->detailClientsButton = nullptr;
     ctx->detailLockButton = nullptr;
     ctx->detailDeauthButton = nullptr;
+    ctx->detailHsSummary = nullptr;
     ctx->connectButton = nullptr;
     ctx->clientsPage = nullptr;
     ctx->clientsList = nullptr;
