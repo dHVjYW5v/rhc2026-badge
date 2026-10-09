@@ -63,6 +63,11 @@ the lock and resume hopping. Stopping the capture (Stop button) always releases 
 Use the lock, then force a client to (re)connect (toggle its Wi-Fi off/on) to reliably capture
 a fresh handshake.
 
+The channel to release is the one cached when you opened the detail page, not a live lookup -
+so the lock always releases even if that network hasn't been re-heard in the last 20 s (and so
+dropped out of the list/graph) while you had it parked. If the radio ever seems stuck on one
+channel with no obvious way back, Stop always force-releases the lock too.
+
 ## Handshake / PMKID capture
 
 While capturing, every EAPOL-Key frame (the WPA/WPA2 4-way handshake) is parsed and buffered per
@@ -109,6 +114,16 @@ hashcat -m 22000 hash.22000 wordlist.txt
 # aircrack-ng (CPU, no conversion needed)
 aircrack-ng -w wordlist.txt capture.pcap
 ```
+
+### Audio notification
+
+As soon as a handshake becomes crackable (M1+M2, or a PMKID) a short 8-bit-style beep plays, so
+you know something was captured without having to watch the screen. If music is currently
+playing on the badge, it fades out, pauses, plays the beep at normal volume, then resumes from
+exactly where it paused and fades back in. The beep is a one-shot notification asset bundled
+with the firmware (`Data/data/wifiscanner/eapol_beep.mp3` in this repo, played from the
+internal `/data` partition) - it doesn't touch the SD card and never shows up in the Music
+app's own library.
 
 ## Deauthentication
 

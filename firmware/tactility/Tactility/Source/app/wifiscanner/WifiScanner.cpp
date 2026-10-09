@@ -2,6 +2,7 @@
 #include <Tactility/Timer.h>
 #include <Tactility/app/alertdialog/AlertDialog.h>
 #include <Tactility/app/wificonnect/WifiConnect.h>
+#include <Tactility/service/music/Music.h>
 #include <Tactility/service/neopixel/NeoPixel.h>
 #include <Tactility/service/wifi/Wifi.h>
 
@@ -161,6 +162,9 @@ struct Context {
     std::vector<uint64_t> visible; // sorted by RSSI, rebuilt each refresh
     uint64_t selectedKey = 0;
     uint32_t detailBeaconBaseline = 0;
+    // Cached at selection time so the lock toggle still works once the AP ages out of ctx->seen
+    // (20s unheard - see ROW_EXPIRY_MS) - a live lookup there left the lock stuck forever.
+    int detailChannel = 0;
     int nextColor = 0; // running counter for assigning SeenAp::colorIndex
     RadioMode mode = RadioMode::ActiveScan;
 
@@ -586,6 +590,66 @@ void sendDeauthBurstOnChannel(const uint8_t* bssid, int channel) {
     sendDeauthBurst(bssid, nullptr);
 }
 
+// ---- EAPOL capture sound ----
+
+// Ships as a firmware asset under the internal /data partition (Data/data/wifiscanner/), not
+// /sdcard/Music, so it plays regardless of SD card contents and never shows up in the Music
+// app's library (that only browses .../Music).
+constexpr auto* EAPOL_BEEP_PATH = "/data/wifiscanner/eapol_beep.mp3";
+constexpr int EAPOL_BEEP_MAX_WAIT_MS = 1000; // bounded: a stuck decoder can't hang this task forever
+constexpr int FADE_STEP_MS = 25;
+constexpr int FADE_STEP_DB = 4;
+constexpr int DUCK_FLOOR_DB = -20; // service::music::setGainDb()'s documented minimum - no mute API
+
+/** Runs on its own task (never the RX callback or the app timer) so its fades and waits can't
+ * delay packet capture. If music is playing: fade it out, pause it, play the beep at normal
+ * volume (so it's actually audible), then resume the track from where it paused while fading
+ * back in. If nothing is playing, just play the beep. */
+void eapolSoundTask(void* /*arg*/) {
+    using namespace tt::service::music;
+    if (isAvailable()) {
+        Telemetry telemetry = getTelemetry();
+        int trackIndex = getTrackIndex();
+        bool wasPlaying = telemetry.state == State::Playing && trackIndex >= 0;
+        uint32_t savedPosition = telemetry.positionSeconds;
+        int originalGain = getGainDb();
+
+        if (wasPlaying) {
+            for (int g = originalGain; g > DUCK_FLOOR_DB; g -= FADE_STEP_DB) {
+                setGainDb(g);
+                vTaskDelay(pdMS_TO_TICKS(FADE_STEP_MS));
+            }
+            setGainDb(DUCK_FLOOR_DB);
+            playPause(); // freezes the track at savedPosition
+            setGainDb(originalGain); // restore before the beep, so it isn't ducked too
+        }
+
+        enqueueAndPlay(EAPOL_BEEP_PATH);
+        for (int waited = 0; waited < EAPOL_BEEP_MAX_WAIT_MS && !getTelemetry().finished; waited += 20) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        removeFromQueueByPath(EAPOL_BEEP_PATH); // one-shot notification, not a library track
+
+        if (wasPlaying) {
+            setGainDb(DUCK_FLOOR_DB); // drop back down first, so the resume itself fades in
+            playQueueIndex(trackIndex);
+            seek(savedPosition);
+            for (int g = DUCK_FLOOR_DB; g < originalGain; g += FADE_STEP_DB) {
+                setGainDb(g);
+                vTaskDelay(pdMS_TO_TICKS(FADE_STEP_MS));
+            }
+            setGainDb(originalGain);
+        }
+    }
+    vTaskDelete(nullptr);
+}
+
+/** Fire-and-forget: called from flushHandshakes() when a handshake just became crackable. */
+void triggerEapolSound() {
+    xTaskCreate([](void* arg) { eapolSoundTask(arg); }, "wifiscanner_beep", 4096, nullptr,
+        tskIDLE_PRIORITY + 1, nullptr);
+}
+
 // ---- .pcap writing (handshake export to SD) ----
 
 void pcapU32(FILE* f, uint32_t v) { fwrite(&v, 4, 1, f); } // ESP32 is little-endian = pcap LE
@@ -665,10 +729,13 @@ void flushHandshakes(Context* ctx) {
         }
         ctx->mutex.unlock();
     }
-    if (have && savePcap(*ready, key)) {
-        if (ctx->mutex.lock(50 / portTICK_PERIOD_MS)) {
-            ctx->handshakesSaved++;
-            ctx->mutex.unlock();
+    if (have) {
+        triggerEapolSound(); // newly crackable (M1+M2 or PMKID) - independent of the SD write below
+        if (savePcap(*ready, key)) {
+            if (ctx->mutex.lock(50 / portTICK_PERIOD_MS)) {
+                ctx->handshakesSaved++;
+                ctx->mutex.unlock();
+            }
         }
     }
 #else
@@ -1083,10 +1150,12 @@ void updateDetail(Context* ctx);
 // (or PMKID) lands on us instead of being missed while hopping. Second tap releases the lock.
 void onToggleLock(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    // Read the channel cached at selection time, not a live ctx->seen lookup: if this AP hasn't
+    // been re-heard in 20s it has aged out of ctx->seen (see ROW_EXPIRY_MS), and a live lookup
+    // here would fail silently, leaving the radio parked forever with no way to release it.
     int channel = 0;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
-        auto it = ctx->seen.find(ctx->selectedKey);
-        if (it != ctx->seen.end()) channel = it->second.record.channel;
+        channel = ctx->detailChannel;
         ctx->mutex.unlock();
     }
     if (channel < 1 || channel > 13) return;
@@ -1146,6 +1215,7 @@ void onSelectFromList(lv_event_t* event) {
         ctx->selectedKey = key;
         auto it = ctx->seen.find(key);
         ctx->detailBeaconBaseline = it != ctx->seen.end() ? it->second.packetCount : 0;
+        ctx->detailChannel = it != ctx->seen.end() ? (int)it->second.record.channel : 0;
         ctx->mutex.unlock();
     }
     if (key != 0) showPage(ctx, Page::Detail);
