@@ -1,5 +1,8 @@
 # Romhack Camp Badge 2026
 
+## Setup your badge
+[badge.romhack.io](https://badge.romhack.io)
+
 ## Hardware
 
 |  |  |
