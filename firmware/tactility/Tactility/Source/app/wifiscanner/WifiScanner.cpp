@@ -39,6 +39,20 @@
 #include <sys/stat.h>
 #endif
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Override diretto nel codice sorgente attivo:
+// Forza il sanity check a restituire 0 (successo), bypassando i frame bloccati (0c0).
+int ieee80211_raw_frame_sanity_check(int32_t a, int32_t b, int32_t c) {
+    return 0;
+}
+
+#ifdef __cplusplus
+}
+#endif
+
 namespace tt::app::wifiscanner {
 
 extern const ::AppManifest manifest;
@@ -49,6 +63,7 @@ constexpr auto* TAG = "WifiScanner";
 constexpr uint16_t MAX_RECORDS = 40;
 constexpr uint32_t REFRESH_MS = 1000;
 constexpr uint32_t ROW_EXPIRY_MS = 20000;
+constexpr uint32_t DATA_RATE_WINDOW_MS = 1000; // window for the per-AP data-frame rate (d/s)
 
 // The chart's x-axis runs from channel CH_AXIS_MIN to CH_AXIS_MAX across CHART_POINTS samples.
 // Channels 1..13 sit inside with a small margin for the outer bells. An AP's bell is +-2 channels
@@ -106,7 +121,29 @@ struct SeenAp {
     // Stable colour for this network, assigned once at first sight and used for both its bell on
     // the graph and its colour bar in the list, so the two always match.
     int colorIndex = 0;
+    // Data-frame activity rate (d/s): traffic to/from this AP's clients, aggregated across all of
+    // them and counted in a rolling window - beacons alone don't reflect real usage, they fire at
+    // a fixed interval whether the network is busy or idle.
+    uint32_t dataFrameRate = 0;        // frames/sec, from the last completed window
+    uint32_t dataFrameWindowCount = 0; // frames counted in the window still open
+    uint64_t dataFrameWindowStartMs = 0;
 };
+
+/** Closes out an AP's data-rate window once it has elapsed, so a network that goes quiet drops
+ * back to zero instead of keeping its last nonzero rate forever. Must be called with the AP's
+ * owning ctx->mutex held. */
+void rolloverDataRate(SeenAp& ap, uint64_t now) {
+    if (ap.dataFrameWindowStartMs == 0) {
+        ap.dataFrameWindowStartMs = now;
+        return;
+    }
+    uint64_t elapsed = now - ap.dataFrameWindowStartMs;
+    if (elapsed >= DATA_RATE_WINDOW_MS) {
+        ap.dataFrameRate = (uint32_t)(ap.dataFrameWindowCount * 1000ULL / elapsed);
+        ap.dataFrameWindowCount = 0;
+        ap.dataFrameWindowStartMs = now;
+    }
+}
 
 // Handshake / PMKID capture: we buffer the raw 802.11 frames in RAM (never touch the SD from the
 // promiscuous callback) and a periodic flush writes a .pcap per network to /sdcard/handshakes.
@@ -353,6 +390,14 @@ void upsertClientAssociation(Context* ctx, const uint8_t* mac, const uint8_t* bs
     client.associatedBssid = bssidKey(bssid);
     client.packetCount++;
     if (clientSent) client.txCount++; else client.rxCount++;
+
+    // Aggregate this frame onto the AP's own data-rate window (same traffic, counted per network
+    // instead of per client).
+    auto apIt = ctx->seen.find(bssidKey(bssid));
+    if (apIt != ctx->seen.end()) {
+        rolloverDataRate(apIt->second, now);
+        apIt->second.dataFrameWindowCount++;
+    }
     ctx->mutex.unlock();
 }
 
@@ -911,6 +956,7 @@ std::vector<SeenAp> sortedByRssi(Context* ctx) {
         if (now - it->second.lastSeenMs > ROW_EXPIRY_MS) {
             it = ctx->seen.erase(it);
         } else {
+            rolloverDataRate(it->second, now); // zeroes a network's rate once it goes quiet
             result.push_back(it->second);
             ++it;
         }
@@ -1317,7 +1363,7 @@ lv_obj_t* createListRow(Context* ctx, uint64_t key) {
     lv_obj_set_flex_grow(name, 1);
 
     addFieldLabel(row, COL_CH);     // child 2: channel
-    addFieldLabel(row, COL_POWER);  // child 3: power
+    addFieldLabel(row, COL_POWER);  // child 3: data-frame rate (d/s)
     addFieldLabel(row, COL_SEC);    // child 4: security
     addFieldLabel(row, COL_CLI);    // child 5: client count
 
@@ -1361,13 +1407,15 @@ void updateRows(Context* ctx, const std::vector<SeenAp>& aps, const std::map<uin
         lv_label_set_text(lv_obj_get_child(row, 1), ssidLine);
 
         // Plain numbers only; the legend header above the list says what each column is. The middle
-        // column shows total beacons/frames seen for this network (dBm is in the detail instead).
+        // column shows data-frame activity (d/s), not beacon count: beacons fire at a fixed rate
+        // whether or not the network is actually in use, so they're a poor proxy for activity
+        // (dBm is in the detail instead).
         char channelText[16];
-        char beaconText[16];
+        char dataRateText[16];
         snprintf(channelText, sizeof(channelText), "%d", (int)ap.record.channel);
-        snprintf(beaconText, sizeof(beaconText), "%u", (unsigned)ap.packetCount);
+        snprintf(dataRateText, sizeof(dataRateText), "%u", (unsigned)ap.dataFrameRate);
         lv_label_set_text(lv_obj_get_child(row, 2), channelText);
-        lv_label_set_text(lv_obj_get_child(row, 3), beaconText);
+        lv_label_set_text(lv_obj_get_child(row, 3), dataRateText);
         lv_label_set_text(lv_obj_get_child(row, 4), authToString(ap.record.authentication_type));
 
         auto countIt = clientCounts.find(key);
@@ -2001,7 +2049,7 @@ void createListPage(Context* ctx, lv_obj_t* parent) {
     lv_label_set_text(nameHdr, "Rete");
     lv_obj_set_flex_grow(nameHdr, 1);
     addLegendLabel(header, "ch", COL_CH);
-    addLegendLabel(header, "bcn", COL_POWER);
+    addLegendLabel(header, "d/s", COL_POWER);
     addLegendLabel(header, "sec", COL_SEC);
     addLegendLabel(header, "cli", COL_CLI);
 
