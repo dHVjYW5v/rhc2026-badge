@@ -405,7 +405,9 @@ void handleEapol(Context* ctx, const uint8_t* payload, int len, uint8_t subtype,
         // Diagnostic: tells apart "M1 never captured" (so this scan never even ran) from "M1
         // captured but this AP just doesn't send a PMKID KDE" (which is a legitimate, common
         // case - PMKID in M1 is optional and vendor-dependent, not every router sends one).
-        LOG_I(TAG, "handshake: M1 for AP %02x:%02x:%02x:%02x:%02x:%02x, pmkid=%s",
+        // LOG_W, not LOG_I: on this build Info-level lines never reach the serial log (confirmed
+        // empirically - even the pre-existing deauth LOG_I never showed), only Warning does.
+        LOG_W(TAG, "handshake: M1 for AP %02x:%02x:%02x:%02x:%02x:%02x, pmkid=%s",
             bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], pmkid ? "yes" : "no");
     }
 
@@ -429,7 +431,8 @@ void handleEapol(Context* ctx, const uint8_t* payload, int len, uint8_t subtype,
         hc.saved = false; // a new message arrived - allow a re-save with more of the handshake
         // Diagnostic: shows the real capture order (M1 is the one most likely lost to the
         // channel-hop race, since it fires within ms of association - well under one hop dwell).
-        LOG_I(TAG, "handshake: M%d captured, mask now 0x%02x", slot + 1, hc.msgMask);
+        // LOG_W, not LOG_I: see the note on the M1/PMKID log above - Info never reaches the log.
+        LOG_W(TAG, "handshake: M%d captured, mask now 0x%02x", slot + 1, hc.msgMask);
     }
     if (pmkid && !hc.hasPmkid) { hc.hasPmkid = true; ctx->pmkidSeen++; }
     ctx->mutex.unlock();
@@ -593,7 +596,9 @@ void sendDeauthFrame(const uint8_t* addr1, const uint8_t* addr2, const uint8_t* 
 void sendDeauthBurst(const uint8_t* bssid, const uint8_t* client) {
     const uint8_t* target = (client != nullptr) ? client : BROADCAST_MAC;
     for (int block = 0; block < DEAUTH_BLOCK_COUNT; block++) {
-        LOG_I(TAG, "deauth: block %d/%d, %d frames to %02x:%02x:%02x:%02x:%02x:%02x for AP %02x:%02x:%02x:%02x:%02x:%02x",
+        // LOG_W, not LOG_I: Info-level lines never reach the serial log on this build (confirmed
+        // empirically), only Warning and above do.
+        LOG_W(TAG, "deauth: block %d/%d, %d frames to %02x:%02x:%02x:%02x:%02x:%02x for AP %02x:%02x:%02x:%02x:%02x:%02x",
             block + 1, DEAUTH_BLOCK_COUNT, DEAUTH_BURST_COUNT,
             target[0], target[1], target[2], target[3], target[4], target[5],
             bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
