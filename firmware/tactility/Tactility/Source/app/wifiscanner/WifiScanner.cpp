@@ -123,6 +123,12 @@ struct HandshakeCapture {
     uint8_t msgMask = 0;   // bit i set once Mi+1 is captured
     bool hasPmkid = false;
     bool saved = false;
+    // Separate from `saved`: `saved` is deliberately re-armed by every new message (so a later,
+    // more complete capture overwrites the .pcap), but the beep must fire exactly once per
+    // handshake - otherwise M3/M4 landing moments after M1+M2 each re-arm `saved` and spawn a
+    // second, overlapping eapolSoundTask that races the first for the Music service's gain/queue
+    // state, which is why it can go silent instead of beeping twice.
+    bool beepFired = false;
 };
 
 /** A device seen only through passive capture: probing for a network, or associated to one. */
@@ -396,6 +402,11 @@ void handleEapol(Context* ctx, const uint8_t* payload, int len, uint8_t subtype,
             if (eapol[i] == 0xDD && eapol[i + 2] == 0x00 && eapol[i + 3] == 0x0F &&
                 eapol[i + 4] == 0xAC && eapol[i + 5] == 0x04) { pmkid = true; break; }
         }
+        // Diagnostic: tells apart "M1 never captured" (so this scan never even ran) from "M1
+        // captured but this AP just doesn't send a PMKID KDE" (which is a legitimate, common
+        // case - PMKID in M1 is optional and vendor-dependent, not every router sends one).
+        LOG_I(TAG, "handshake: M1 for AP %02x:%02x:%02x:%02x:%02x:%02x, pmkid=%s",
+            bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], pmkid ? "yes" : "no");
     }
 
     if (!ctx->mutex.lock(0)) return;
@@ -416,6 +427,9 @@ void handleEapol(Context* ctx, const uint8_t* payload, int len, uint8_t subtype,
         hc.eapolLen[slot] = n;
         hc.msgMask |= (uint8_t)(1 << slot);
         hc.saved = false; // a new message arrived - allow a re-save with more of the handshake
+        // Diagnostic: shows the real capture order (M1 is the one most likely lost to the
+        // channel-hop race, since it fires within ms of association - well under one hop dwell).
+        LOG_I(TAG, "handshake: M%d captured, mask now 0x%02x", slot + 1, hc.msgMask);
     }
     if (pmkid && !hc.hasPmkid) { hc.hasPmkid = true; ctx->pmkidSeen++; }
     ctx->mutex.unlock();
@@ -733,21 +747,29 @@ void flushHandshakes(Context* ctx) {
     auto ready = std::make_unique<HandshakeCapture>();
     uint64_t key = 0;
     bool have = false;
+    bool beep = false;
     if (ctx->mutex.lock(50 / portTICK_PERIOD_MS)) {
         for (auto& [k, hc] : ctx->handshakes) {
             bool crackable = ((hc.msgMask & 0x03) == 0x03) || hc.hasPmkid; // M1+M2, or PMKID
-            if (crackable && !hc.saved) {
+            // `saved` is re-armed by every new message (M3/M4 arriving after M1+M2), so it can't
+            // gate the beep too - that fired a second eapolSoundTask moments after the first,
+            // racing it for the Music service's state and killing the audible beep. `beepFired`
+            // is set once and never reset, so this fires exactly once per handshake.
+            if (crackable && !hc.beepFired) {
+                hc.beepFired = true;
+                beep = true;
+            }
+            if (crackable && !hc.saved && !have) {
                 *ready = hc;
                 key = k;
                 hc.saved = true;
                 have = true;
-                break;
             }
         }
         ctx->mutex.unlock();
     }
+    if (beep) triggerEapolSound();
     if (have) {
-        triggerEapolSound(); // newly crackable (M1+M2 or PMKID) - independent of the SD write below
         if (savePcap(*ready, key)) {
             if (ctx->mutex.lock(50 / portTICK_PERIOD_MS)) {
                 ctx->handshakesSaved++;
