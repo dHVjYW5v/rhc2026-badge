@@ -17,6 +17,7 @@
 #include <bindings/es8156.h>
 #include <tactility/bindings/esp32_wifi_pinned.h>
 #include <tactility/bindings/esp32_ble.h>
+#include <tactility/bindings/esp32_usbdevice.h>
 #include <bindings/rgb_display.h>
 
 #include <tactility/bindings/esp32_adc_oneshot.h>
@@ -167,5 +168,12 @@
 		pullups;
 	};
 
+	usbdevice0 {
+		compatible = "espressif,esp32-usbdevice";
+
+		usbdevicemsc0 {
+			compatible = "espressif,esp32-usbdevice-msc";
+		};
+	};
 
 };

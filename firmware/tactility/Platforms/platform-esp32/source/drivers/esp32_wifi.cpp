@@ -87,6 +87,20 @@ WifiAuthenticationType to_wifi_authentication_type(wifi_auth_mode_t mode) {
     }
 }
 
+WifiCipherType to_wifi_cipher_type(wifi_cipher_type_t cipher) {
+    switch (cipher) {
+        case WIFI_CIPHER_TYPE_NONE: return WIFI_AP_CIPHER_NONE;
+        case WIFI_CIPHER_TYPE_WEP40:
+        case WIFI_CIPHER_TYPE_WEP104: return WIFI_AP_CIPHER_WEP;
+        case WIFI_CIPHER_TYPE_TKIP: return WIFI_AP_CIPHER_TKIP;
+        case WIFI_CIPHER_TYPE_CCMP: return WIFI_AP_CIPHER_CCMP;
+        case WIFI_CIPHER_TYPE_TKIP_CCMP: return WIFI_AP_CIPHER_TKIP_CCMP;
+        case WIFI_CIPHER_TYPE_GCMP:
+        case WIFI_CIPHER_TYPE_GCMP256: return WIFI_AP_CIPHER_GCMP;
+        default: return WIFI_AP_CIPHER_UNKNOWN;
+    }
+}
+
 /**
  * Maps the AP's disconnect reason onto what the user can do about it. Everything that is not
  * clearly a bad key or a missing network is reported as a timeout, since the remaining reasons are
@@ -418,6 +432,17 @@ error_t api_get_scan_results(Device* device, WifiApRecord* results, size_t* num_
         dst.rssi = src.rssi;
         dst.channel = src.primary;
         dst.authentication_type = to_wifi_authentication_type(src.authmode);
+        memcpy(dst.bssid, src.bssid, sizeof(dst.bssid));
+        dst.pairwise_cipher = to_wifi_cipher_type(src.pairwise_cipher);
+        dst.secondary_channel = static_cast<uint8_t>(src.second);
+        dst.phy_flags = (src.phy_11b ? WIFI_AP_PHY_11B : 0) | (src.phy_11g ? WIFI_AP_PHY_11G : 0) |
+            (src.phy_11n ? WIFI_AP_PHY_11N : 0) | (src.phy_11ax ? WIFI_AP_PHY_11AX : 0) |
+            (src.wps ? WIFI_AP_PHY_WPS : 0);
+        memset(dst.country, 0, sizeof(dst.country));
+        for (size_t c = 0; c < 2; c++) {
+            // Anything that is not a letter (for example the "01" world code) is left out.
+            if (src.country.cc[c] >= 'A' && src.country.cc[c] <= 'Z') dst.country[c] = src.country.cc[c];
+        }
     }
     *num_results = count;
     mutex_unlock(&ctx->mutex);

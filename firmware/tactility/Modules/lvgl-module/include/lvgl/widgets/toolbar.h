@@ -29,6 +29,14 @@ void lvgl_toolbar_configure(const ToolbarConfig* config);
 void lvgl_toolbar_trigger_back();
 
 /**
+ * @brief Let one app handle the dedicated back key itself, for example to step out of a sub-page.
+ * While set, lvgl_toolbar_trigger_back() calls this instead of the global navigation action.
+ * The caller clears it (callback = nullptr) when its widgets go away.
+ * @warning Called on the LVGL task with the LVGL lock held.
+ */
+void lvgl_toolbar_set_back_override(void (*callback)(void* userData), void* userData);
+
+/**
  * @brief Create a toolbar widget with the given title.
  * @param[in] parent the parent object for the new toolbar
  * @param[in] title the toolbar title

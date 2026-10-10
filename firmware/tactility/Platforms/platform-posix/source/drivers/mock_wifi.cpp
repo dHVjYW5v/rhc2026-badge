@@ -146,6 +146,12 @@ error_t apiGetScanResults(Device* device, WifiApRecord* results, size_t* num_res
         dst.rssi = src.rssi;
         dst.channel = 1;
         dst.authentication_type = src.authentication_type;
+        memset(dst.bssid, 0, sizeof(dst.bssid));
+        dst.bssid[5] = static_cast<uint8_t>(i + 1);
+        dst.pairwise_cipher = WIFI_AP_CIPHER_UNKNOWN;
+        dst.secondary_channel = 0;
+        dst.phy_flags = 0;
+        memset(dst.country, 0, sizeof(dst.country));
     }
     *num_results = count;
     return ERROR_NONE;

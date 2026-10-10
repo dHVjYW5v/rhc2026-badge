@@ -47,10 +47,6 @@ void createAppWidget(const ::AppManifest* manifest, lv_obj_t* list) {
 
 // The badge's own apps come first; everything else stays alphabetical below them.
 constexpr const char* PINNED_APP_IDS[] = {
-    "Announcements",
-    "Agenda",
-    "TagQuest",
-    "VenueMap",
     "Lighting",
     "tactility.pingpong",
     "MusicPlayer",
