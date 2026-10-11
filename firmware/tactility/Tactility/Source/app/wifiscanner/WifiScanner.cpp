@@ -179,6 +179,10 @@ struct Context {
 
     lv_obj_t* toolbar = nullptr;
     lv_obj_t* statusLabel = nullptr;
+    lv_obj_t* modeBadge = nullptr;
+    lv_obj_t* modeBadgeLabel = nullptr;
+    lv_obj_t* statsLabel = nullptr;
+    lv_obj_t* activeChannelIndicator = nullptr;
     lv_obj_t* graphPage = nullptr;
     lv_obj_t* chart = nullptr;
     lv_obj_t* labelLayer = nullptr;
@@ -1295,6 +1299,33 @@ void updateGraph(Context* ctx, const std::vector<SeenAp>& aps) {
     for (int i = drawn; i < MAX_SERIES; i++) {
         lv_chart_hide_series(ctx->chart, ctx->series[i], true);
     }
+
+    if (ctx->activeChannelIndicator != nullptr) {
+        RadioMode mode = RadioMode::Stopped;
+        if (ctx->mutex.lock(0)) {
+            mode = ctx->mode;
+            ctx->mutex.unlock();
+        }
+        if (mode == RadioMode::Capture) {
+            int lock = getCaptureLockChannel();
+            int ch = (lock >= 1 && lock <= 13) ? lock : getCurrentRadioChannel();
+            if (ch >= 1 && ch <= 13 && chartWidth > 0) {
+                lv_obj_remove_flag(ctx->activeChannelIndicator, LV_OBJ_FLAG_HIDDEN);
+                int xPx = (int)(chartWidth * channelFraction(ch)) - 7;
+                if (xPx < 0) xPx = 0;
+                if (xPx + 14 > chartWidth) xPx = chartWidth - 14;
+                lv_obj_set_pos(ctx->activeChannelIndicator, xPx, 0);
+                bool isLocked = (lock >= 1 && lock <= 13);
+                uint32_t col = isLocked ? 0xF59E0B : 0x06B6D4;
+                lv_obj_set_style_bg_color(ctx->activeChannelIndicator, lv_color_hex(col), 0);
+                lv_obj_set_style_border_color(ctx->activeChannelIndicator, lv_color_hex(col), 0);
+            } else {
+                lv_obj_add_flag(ctx->activeChannelIndicator, LV_OBJ_FLAG_HIDDEN);
+            }
+        } else {
+            lv_obj_add_flag(ctx->activeChannelIndicator, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 }
 
 void onSelectFromList(lv_event_t* event);
@@ -1312,16 +1343,41 @@ void refreshModeButtons(Context* ctx) {
         return;
     }
     if (ctx->scanButton != nullptr) {
-        if (mode == RadioMode::ActiveScan) lv_obj_add_state(ctx->scanButton, LV_STATE_DISABLED);
-        else lv_obj_remove_state(ctx->scanButton, LV_STATE_DISABLED);
+        if (mode == RadioMode::ActiveScan) {
+            lv_obj_add_state(ctx->scanButton, LV_STATE_DISABLED);
+            lv_obj_set_style_bg_color(ctx->scanButton, lv_color_hex(0x0284C7), 0);
+        } else {
+            lv_obj_remove_state(ctx->scanButton, LV_STATE_DISABLED);
+            lv_obj_set_style_bg_color(ctx->scanButton, lv_color_hex(0x202020), 0);
+        }
     }
     if (ctx->captureButton != nullptr) {
-        if (mode == RadioMode::Capture || !isCaptureSupported()) lv_obj_add_state(ctx->captureButton, LV_STATE_DISABLED);
-        else lv_obj_remove_state(ctx->captureButton, LV_STATE_DISABLED);
+        if (mode == RadioMode::Capture || !isCaptureSupported()) {
+            lv_obj_add_state(ctx->captureButton, LV_STATE_DISABLED);
+            int lock = getCaptureLockChannel();
+            bool isLocked = (lock >= 1 && lock <= 13);
+            lv_obj_set_style_bg_color(ctx->captureButton, lv_color_hex(isLocked ? 0xD97706 : 0x0D9488), 0);
+            lv_obj_t* lbl = lv_obj_get_child(ctx->captureButton, 0);
+            if (lbl != nullptr) {
+                lv_label_set_text(lbl, isLocked ? LV_SYMBOL_SETTINGS : LV_SYMBOL_EYE_OPEN);
+            }
+        } else {
+            lv_obj_remove_state(ctx->captureButton, LV_STATE_DISABLED);
+            lv_obj_set_style_bg_color(ctx->captureButton, lv_color_hex(0x202020), 0);
+            lv_obj_t* lbl = lv_obj_get_child(ctx->captureButton, 0);
+            if (lbl != nullptr) {
+                lv_label_set_text(lbl, LV_SYMBOL_EYE_OPEN);
+            }
+        }
     }
     if (ctx->stopButton != nullptr) {
-        if (mode == RadioMode::Stopped) lv_obj_add_state(ctx->stopButton, LV_STATE_DISABLED);
-        else lv_obj_remove_state(ctx->stopButton, LV_STATE_DISABLED);
+        if (mode == RadioMode::Stopped) {
+            lv_obj_add_state(ctx->stopButton, LV_STATE_DISABLED);
+            lv_obj_set_style_bg_color(ctx->stopButton, lv_color_hex(0x202020), 0);
+        } else {
+            lv_obj_remove_state(ctx->stopButton, LV_STATE_DISABLED);
+            lv_obj_set_style_bg_color(ctx->stopButton, lv_color_hex(0xDC2626), 0);
+        }
     }
 }
 
@@ -1340,6 +1396,11 @@ void setMode(Context* ctx, RadioMode mode) {
 
     if (mode == RadioMode::Stopped) {
         lvgl_lock();
+        if (ctx->modeBadgeLabel != nullptr) {
+            lv_label_set_text(ctx->modeBadgeLabel, "STOP");
+            lv_obj_set_style_bg_color(ctx->modeBadge, lv_color_hex(0x282828), 0);
+            lv_obj_set_style_text_color(ctx->modeBadgeLabel, lv_color_hex(0x888888), 0);
+        }
         if (ctx->statusLabel != nullptr) lv_label_set_text(ctx->statusLabel, "Capture stopped");
         lvgl_unlock();
     }
@@ -1818,6 +1879,12 @@ void createAxisLabels(lv_obj_t* parent) {
         snprintf(text, sizeof(text), "%d", channel);
         auto* label = lv_label_create(row);
         lv_label_set_text(label, text);
+        bool isPrimary = (channel == 1 || channel == 6 || channel == 11);
+        if (isPrimary) {
+            lv_obj_set_style_text_color(label, lv_color_hex(0x38BDF8), 0);
+        } else {
+            lv_obj_set_style_text_color(label, lv_color_hex(0x757575), 0);
+        }
         lv_obj_set_x(label, lv_pct((int)(100 * channelFraction(channel))));
         lv_obj_set_style_translate_x(label, channel < 10 ? -4 : -8, 0);
     }
@@ -1826,14 +1893,39 @@ void createAxisLabels(lv_obj_t* parent) {
 void createChannelGrid(lv_obj_t* chartWrapper) {
     for (int channel = 1; channel <= 13; channel++) {
         auto* line = lv_obj_create(chartWrapper);
-        lv_obj_set_size(line, 1, LV_PCT(100));
+        bool isPrimary = (channel == 1 || channel == 6 || channel == 11);
+        lv_obj_set_size(line, isPrimary ? 2 : 1, LV_PCT(100));
         lv_obj_set_style_border_width(line, 0, 0);
         lv_obj_set_style_radius(line, 0, 0);
-        lv_obj_set_style_bg_color(line, lv_color_hex(0x606060), 0);
-        lv_obj_set_style_bg_opa(line, LV_OPA_50, 0);
+        if (isPrimary) {
+            lv_obj_set_style_bg_color(line, lv_color_hex(0x38BDF8), 0);
+            lv_obj_set_style_bg_opa(line, LV_OPA_70, 0);
+        } else {
+            lv_obj_set_style_bg_color(line, lv_color_hex(0x505050), 0);
+            lv_obj_set_style_bg_opa(line, LV_OPA_30, 0);
+        }
         lv_obj_remove_flag(line, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_remove_flag(line, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_set_x(line, lv_pct((int)(100 * channelFraction(channel))));
+    }
+}
+
+void createYAxisLabels(lv_obj_t* chartWrapper) {
+    const struct { const char* text; int pctY; } marks[] = {
+        {"-30", 2},
+        {"-50", 26},
+        {"-70", 55},
+        {"-90", 84},
+    };
+    for (const auto& m : marks) {
+        auto* label = lv_label_create(chartWrapper);
+        lv_label_set_text(label, m.text);
+        lv_obj_set_style_text_color(label, lv_color_hex(0x606060), 0);
+        lv_obj_set_style_text_opa(label, LV_OPA_80, 0);
+        lv_obj_set_x(label, 2);
+        lv_obj_set_y(label, lv_pct(m.pctY));
+        lv_obj_remove_flag(label, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(label, LV_OBJ_FLAG_SCROLLABLE);
     }
 }
 
@@ -2272,9 +2364,38 @@ void createGraphPage(Context* ctx, lv_obj_t* parent) {
     lv_obj_set_style_border_width(leftColumn, 0, 0);
     lv_obj_remove_flag(leftColumn, LV_OBJ_FLAG_SCROLLABLE);
 
-    ctx->statusLabel = lv_label_create(leftColumn);
-    lv_label_set_text(ctx->statusLabel, "...");
-    lv_obj_set_width(ctx->statusLabel, LV_PCT(100));
+    auto* statusBar = lv_obj_create(leftColumn);
+    lv_obj_set_size(statusBar, LV_PCT(100), 20);
+    lv_obj_set_flex_flow(statusBar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(statusBar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_hor(statusBar, 2, 0);
+    lv_obj_set_style_pad_ver(statusBar, 0, 0);
+    lv_obj_set_style_border_width(statusBar, 0, 0);
+    lv_obj_set_style_bg_opa(statusBar, LV_OPA_TRANSP, 0);
+    lv_obj_remove_flag(statusBar, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->modeBadge = lv_obj_create(statusBar);
+    lv_obj_set_size(ctx->modeBadge, LV_SIZE_CONTENT, 16);
+    lv_obj_set_style_pad_hor(ctx->modeBadge, 6, 0);
+    lv_obj_set_style_pad_ver(ctx->modeBadge, 0, 0);
+    lv_obj_set_style_radius(ctx->modeBadge, 4, 0);
+    lv_obj_set_style_border_width(ctx->modeBadge, 0, 0);
+    lv_obj_set_style_bg_color(ctx->modeBadge, lv_color_hex(0x282828), 0);
+    lv_obj_set_style_bg_opa(ctx->modeBadge, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(ctx->modeBadge, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->modeBadgeLabel = lv_label_create(ctx->modeBadge);
+    lv_label_set_text(ctx->modeBadgeLabel, "STOP");
+    lv_obj_set_style_text_color(ctx->modeBadgeLabel, lv_color_hex(0x888888), 0);
+    lv_obj_center(ctx->modeBadgeLabel);
+
+    ctx->statsLabel = lv_label_create(statusBar);
+    lv_obj_set_flex_grow(ctx->statsLabel, 1);
+    lv_obj_set_style_pad_left(ctx->statsLabel, 6, 0);
+    lv_obj_set_style_text_color(ctx->statsLabel, lv_color_hex(0xD4D4D8), 0);
+    lv_label_set_text(ctx->statsLabel, "0 AP");
+
+    ctx->statusLabel = ctx->statsLabel;
 
     auto* chartWrapper = lv_obj_create(leftColumn);
     lv_obj_set_width(chartWrapper, LV_PCT(100));
@@ -2300,6 +2421,19 @@ void createGraphPage(Context* ctx, lv_obj_t* parent) {
 
     createChannelGrid(chartWrapper);
 
+    ctx->activeChannelIndicator = lv_obj_create(chartWrapper);
+    lv_obj_set_size(ctx->activeChannelIndicator, 14, LV_PCT(100));
+    lv_obj_set_style_border_width(ctx->activeChannelIndicator, 1, 0);
+    lv_obj_set_style_border_color(ctx->activeChannelIndicator, lv_color_hex(0x06B6D4), 0);
+    lv_obj_set_style_radius(ctx->activeChannelIndicator, 3, 0);
+    lv_obj_set_style_bg_color(ctx->activeChannelIndicator, lv_color_hex(0x06B6D4), 0);
+    lv_obj_set_style_bg_opa(ctx->activeChannelIndicator, LV_OPA_20, 0);
+    lv_obj_remove_flag(ctx->activeChannelIndicator, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(ctx->activeChannelIndicator, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(ctx->activeChannelIndicator, LV_OBJ_FLAG_HIDDEN);
+
+    createYAxisLabels(chartWrapper);
+
     ctx->labelLayer = lv_obj_create(chartWrapper);
     lv_obj_set_size(ctx->labelLayer, LV_PCT(100), LV_PCT(100));
     lv_obj_set_style_pad_all(ctx->labelLayer, 0, 0);
@@ -2320,7 +2454,7 @@ void createGraphPage(Context* ctx, lv_obj_t* parent) {
     lv_obj_remove_flag(rightColumn, LV_OBJ_FLAG_SCROLLABLE);
 
     ctx->scanButton = createIconButton(rightColumn, LV_SYMBOL_WIFI, onStartScan, ctx, BTN);
-    ctx->captureButton = createIconButton(rightColumn, "CH", onStartCapture, ctx, BTN);
+    ctx->captureButton = createIconButton(rightColumn, LV_SYMBOL_EYE_OPEN, onStartCapture, ctx, BTN);
     ctx->stopButton = createIconButton(rightColumn, LV_SYMBOL_STOP, onStop, ctx, BTN);
     createIconButton(rightColumn, LV_SYMBOL_LIST, onShowList, ctx, BTN);
     refreshModeButtons(ctx);
@@ -2447,30 +2581,59 @@ void updateViews(Context* ctx) {
     }
 
     lvgl_lock();
-    if (ctx->statusLabel != nullptr) {
-        char status[80];
+    if (ctx->modeBadgeLabel != nullptr && ctx->statsLabel != nullptr) {
+        char badgeText[16] = "STOP";
+        uint32_t badgeBg = 0x282828;
+        uint32_t badgeFg = 0x888888;
+        char statsText[80] = "";
+
         if (!isRadioUsable()) {
-            snprintf(status, sizeof(status), "Wi-Fi spento, lo accendo...");
+            snprintf(badgeText, sizeof(badgeText), "OFF");
+            badgeBg = 0x3F3F46;
+            badgeFg = 0xD4D4D8;
+            snprintf(statsText, sizeof(statsText), "Wi-Fi in avvio...");
         } else if (mode == RadioMode::Capture) {
 #ifdef ESP_PLATFORM
             int hs = 0, pmkid = 0;
             if (ctx->mutex.lock(0)) { hs = ctx->handshakesSaved; pmkid = ctx->pmkidSeen; ctx->mutex.unlock(); }
             int lock = g_lockChannel.load();
             if (lock >= 1 && lock <= 13) {
-                snprintf(status, sizeof(status), "LOCK ch%d - %u reti, %u cli - HS:%d PMKID:%d",
-                    lock, (unsigned)aps.size(), (unsigned)clientCount, hs, pmkid);
+                snprintf(badgeText, sizeof(badgeText), "LOCK %d", lock);
+                badgeBg = 0x7C2D12;
+                badgeFg = 0xFDBA74;
             } else {
-                snprintf(status, sizeof(status), "ch%d - %u reti, %u cli - HS:%d PMKID:%d",
-                    g_hopChannel.load(), (unsigned)aps.size(), (unsigned)clientCount, hs, pmkid);
+                snprintf(badgeText, sizeof(badgeText), "HOP %d", g_hopChannel.load());
+                badgeBg = 0x0F766E;
+                badgeFg = 0x5EEAD4;
+            }
+            if (pmkid > 0) {
+                snprintf(statsText, sizeof(statsText), "%u AP | %u CLI | HS:%d P:%d",
+                    (unsigned)aps.size(), (unsigned)clientCount, hs, pmkid);
+            } else {
+                snprintf(statsText, sizeof(statsText), "%u AP | %u CLI | HS:%d",
+                    (unsigned)aps.size(), (unsigned)clientCount, hs);
             }
 #else
-            snprintf(status, sizeof(status), "Cattura non disponibile in questo ambiente");
+            snprintf(badgeText, sizeof(badgeText), "SIM");
+            snprintf(statsText, sizeof(statsText), "%u AP | %u CLI", (unsigned)aps.size(), (unsigned)clientCount);
 #endif
+        } else if (mode == RadioMode::ActiveScan) {
+            snprintf(badgeText, sizeof(badgeText), "SCAN");
+            badgeBg = 0x0369A1;
+            badgeFg = 0xE0F2FE;
+            snprintf(statsText, sizeof(statsText), "%u AP rilevati%s", (unsigned)aps.size(),
+                service::wifi::isScanning() ? "..." : "");
         } else {
-            snprintf(status, sizeof(status), "%u reti%s", (unsigned)aps.size(),
-                service::wifi::isScanning() ? " (scansione...)" : "");
+            snprintf(badgeText, sizeof(badgeText), "STOP");
+            badgeBg = 0x282828;
+            badgeFg = 0x888888;
+            snprintf(statsText, sizeof(statsText), "%u AP (fermo)", (unsigned)aps.size());
         }
-        lv_label_set_text(ctx->statusLabel, status);
+
+        lv_label_set_text(ctx->modeBadgeLabel, badgeText);
+        lv_obj_set_style_bg_color(ctx->modeBadge, lv_color_hex(badgeBg), 0);
+        lv_obj_set_style_text_color(ctx->modeBadgeLabel, lv_color_hex(badgeFg), 0);
+        lv_label_set_text(ctx->statsLabel, statsText);
     }
 
     Page page;
@@ -2584,6 +2747,10 @@ void destroyWidgets(void* userData) {
     lvgl_toolbar_set_back_override(nullptr, nullptr);
     ctx->toolbar = nullptr;
     ctx->statusLabel = nullptr;
+    ctx->modeBadge = nullptr;
+    ctx->modeBadgeLabel = nullptr;
+    ctx->statsLabel = nullptr;
+    ctx->activeChannelIndicator = nullptr;
     ctx->graphPage = nullptr;
     ctx->chart = nullptr;
     ctx->labelLayer = nullptr;
