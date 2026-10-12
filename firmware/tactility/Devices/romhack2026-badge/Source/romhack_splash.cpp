@@ -8,26 +8,15 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <miniz.h>
+#include <esp_random.h>
 
 #define TAG "RomhackSplash"
 
 namespace {
 
-// Drawn in bands so the background clear needs one small buffer instead of a full 150KB frame.
-constexpr int CLEAR_BAND_HEIGHT = 40;
-
-// Matches the LVGL splash in Boot.cpp, so handing over to it doesn't visibly shift anything.
-constexpr int ROMHACK_Y = 70;
-constexpr int CYBERSAIYAN_Y = 123;
-constexpr int TRABODA_Y = 206;
-
-void drawCentered(Device* display, const uint8_t* data, int width, int height, int y) {
-    const int x = (ROMHACK_SPLASH_SCREEN_W - width) / 2;
-    // DisplayApi wants an exclusive end coordinate (see lvgl-module's display.cpp flush).
-    display_draw_bitmap(display, x, y, x + width, y + height, data);
-}
-
 void clearToBlack(Device* display) {
+    constexpr int CLEAR_BAND_HEIGHT = 40;
     const size_t band_bytes = (size_t) ROMHACK_SPLASH_SCREEN_W * CLEAR_BAND_HEIGHT * 2;
     auto* band = static_cast<uint8_t*>(malloc(band_bytes));
     if (band == nullptr) {
@@ -47,8 +36,8 @@ void clearToBlack(Device* display) {
 } // namespace
 
 /**
- * Paints the splash to the panel's GRAM before LVGL exists, then lights the backlight. Nothing is
- * mounted yet, so the artwork is linked in as RGB565 and the backlight uses the driver's default.
+ * Paints the splash to the panel's GRAM before LVGL exists, then lights the backlight.
+ * Dynamically picks one of the 4 pentesting bootsplashes (Award BIOS, Win98, Hacker Punk, Retro Terminal).
  */
 extern "C" void romhack_draw_early_splash(void) {
     Device* display = nullptr;
@@ -57,11 +46,30 @@ extern "C" void romhack_draw_early_splash(void) {
         return;
     }
 
-    // The panel still holds whatever survived the last power cycle, so clear before lighting it.
     clearToBlack(display);
-    drawCentered(display, ROMHACK_SPLASH_DATA, ROMHACK_SPLASH_W, ROMHACK_SPLASH_H, ROMHACK_Y);
-    drawCentered(display, CYBERSAIYAN_SPLASH_DATA, CYBERSAIYAN_SPLASH_W, CYBERSAIYAN_SPLASH_H, CYBERSAIYAN_Y);
-    drawCentered(display, TRABODA_SPLASH_DATA, TRABODA_SPLASH_W, TRABODA_SPLASH_H, TRABODA_Y);
+
+    int splash_idx = (int)(esp_random() % ROMHACK_SPLASH_COUNT);
+    const auto& item = ROMHACK_SPLASHES[splash_idx];
+    LOG_I(TAG, "Drawing bootsplash [%d]: %s", splash_idx, item.name);
+
+    auto* decompressed = static_cast<uint8_t*>(malloc(ROMHACK_SPLASH_RAW_SIZE));
+    if (decompressed != nullptr) {
+        size_t written = tinfl_decompress_mem_to_mem(
+            decompressed,
+            ROMHACK_SPLASH_RAW_SIZE,
+            item.zlib_data,
+            item.zlib_size,
+            TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF
+        );
+        if (written == ROMHACK_SPLASH_RAW_SIZE) {
+            display_draw_bitmap(display, 0, 0, ROMHACK_SPLASH_SCREEN_W, ROMHACK_SPLASH_SCREEN_H, decompressed);
+        } else {
+            LOG_E(TAG, "Failed to decompress splash (written: %zu)", written);
+        }
+        free(decompressed);
+    } else {
+        LOG_E(TAG, "Out of memory allocating splash buffer");
+    }
 
     Device* backlight = nullptr;
     if (display_get_backlight(display, &backlight) == ERROR_NONE) {
@@ -72,5 +80,5 @@ extern "C" void romhack_draw_early_splash(void) {
     }
 
     device_put(display);
-    LOG_I(TAG, "Early splash drawn");
+    LOG_I(TAG, "Early splash drawn successfully");
 }

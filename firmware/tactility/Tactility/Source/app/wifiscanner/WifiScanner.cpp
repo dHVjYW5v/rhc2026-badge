@@ -1232,9 +1232,9 @@ void setTacticalMode(Context* ctx, bool enabled) {
     lvgl_lock();
     if (ctx->statusLabel != nullptr) {
         if (g_tactical_mode) {
-            lv_label_set_text(ctx->statusLabel, "TACTICAL MODE (LEDs OFF / Dim)");
+            lv_label_set_text(ctx->statusLabel, "TACTICAL MODE ON");
         } else {
-            lv_label_set_text(ctx->statusLabel, "Tactical Mode OFF");
+            lv_label_set_text(ctx->statusLabel, "TACTICAL MODE OFF");
         }
     }
     lvgl_unlock();
@@ -1423,15 +1423,21 @@ void refreshModeButtons(Context* ctx) {
         }
     }
     if (ctx->captureButton != nullptr) {
+        int lock = getCaptureLockChannel();
+        bool isLocked = (lock >= 1 && lock <= 13);
         if (mode == RadioMode::Capture || !isCaptureSupported()) {
             lv_obj_add_state(ctx->captureButton, LV_STATE_DISABLED);
-            int lock = getCaptureLockChannel();
-            bool isLocked = (lock >= 1 && lock <= 13);
             lv_obj_set_style_bg_color(ctx->captureButton, lv_color_hex(0xDC2626), LV_STATE_DEFAULT);
             lv_obj_set_style_bg_color(ctx->captureButton, lv_color_hex(0xDC2626), LV_STATE_DISABLED);
             lv_obj_t* lbl = lv_obj_get_child(ctx->captureButton, 0);
             if (lbl != nullptr) {
-                lv_label_set_text(lbl, isLocked ? LV_SYMBOL_SETTINGS : LV_SYMBOL_EYE_OPEN);
+                if (isLocked) {
+                    char chBuf[16];
+                    snprintf(chBuf, sizeof(chBuf), "CH %d", lock);
+                    lv_label_set_text(lbl, chBuf);
+                } else {
+                    lv_label_set_text(lbl, LV_SYMBOL_EYE_OPEN);
+                }
             }
         } else {
             lv_obj_remove_state(ctx->captureButton, LV_STATE_DISABLED);
@@ -1439,7 +1445,13 @@ void refreshModeButtons(Context* ctx) {
             lv_obj_remove_local_style_prop(ctx->captureButton, LV_STYLE_BG_COLOR, LV_STATE_DISABLED);
             lv_obj_t* lbl = lv_obj_get_child(ctx->captureButton, 0);
             if (lbl != nullptr) {
-                lv_label_set_text(lbl, LV_SYMBOL_EYE_OPEN);
+                if (isLocked) {
+                    char chBuf[16];
+                    snprintf(chBuf, sizeof(chBuf), "CH %d", lock);
+                    lv_label_set_text(lbl, chBuf);
+                } else {
+                    lv_label_set_text(lbl, LV_SYMBOL_EYE_OPEN);
+                }
             }
         }
     }
@@ -1552,6 +1564,20 @@ static void onMediaKey(uint32_t key, bool is_long_press) {
         updateLeds(ctx);
         if (ctx->page == Page::Detail) updateDetail(ctx);
         lvgl_lock();
+        if (ctx->captureButton != nullptr) {
+            lv_obj_t* lbl = lv_obj_get_child(ctx->captureButton, 0);
+            if (lbl != nullptr) {
+                char chBuf[16];
+                snprintf(chBuf, sizeof(chBuf), "CH %d", ch);
+                lv_label_set_text(lbl, chBuf);
+            }
+        }
+        if (ctx->detailLockButton != nullptr) {
+            char lockText[48];
+            snprintf(lockText, sizeof(lockText), LV_SYMBOL_SETTINGS " Lock: CH %d", ch);
+            lv_obj_t* label = lv_obj_get_child(ctx->detailLockButton, 0);
+            if (label != nullptr) lv_label_set_text(label, lockText);
+        }
         if (ctx->statusLabel != nullptr) {
             char buf[32];
             snprintf(buf, sizeof(buf), "Channel Lock: CH %d", ch);
@@ -1575,6 +1601,20 @@ static void onMediaKey(uint32_t key, bool is_long_press) {
         updateLeds(ctx);
         if (ctx->page == Page::Detail) updateDetail(ctx);
         lvgl_lock();
+        if (ctx->captureButton != nullptr) {
+            lv_obj_t* lbl = lv_obj_get_child(ctx->captureButton, 0);
+            if (lbl != nullptr) {
+                char chBuf[16];
+                snprintf(chBuf, sizeof(chBuf), "CH %d", ch);
+                lv_label_set_text(lbl, chBuf);
+            }
+        }
+        if (ctx->detailLockButton != nullptr) {
+            char lockText[48];
+            snprintf(lockText, sizeof(lockText), LV_SYMBOL_SETTINGS " Lock: CH %d", ch);
+            lv_obj_t* label = lv_obj_get_child(ctx->detailLockButton, 0);
+            if (label != nullptr) lv_label_set_text(label, lockText);
+        }
         if (ctx->statusLabel != nullptr) {
             char buf[32];
             snprintf(buf, sizeof(buf), "Channel Lock: CH %d", ch);
@@ -1672,9 +1712,26 @@ void addLegendLabel(lv_obj_t* header, const char* text, int width) {
     lv_label_set_text(label, text);
 }
 
+void applyFocusStyle(lv_obj_t* obj) {
+    if (obj == nullptr) return;
+    const lv_color_t neon = lv_color_hex(0x00FF88);
+    for (lv_state_t st : { LV_STATE_FOCUSED, LV_STATE_FOCUS_KEY }) {
+        lv_obj_set_style_outline_width(obj, 2, st);
+        lv_obj_set_style_outline_color(obj, neon, st);
+        lv_obj_set_style_outline_pad(obj, 2, st);
+        lv_obj_set_style_outline_opa(obj, LV_OPA_COVER, st);
+        lv_obj_set_style_border_width(obj, 2, st);
+        lv_obj_set_style_border_color(obj, neon, st);
+        lv_obj_set_style_border_opa(obj, LV_OPA_COVER, st);
+        lv_obj_set_style_bg_color(obj, neon, st);
+        lv_obj_set_style_bg_opa(obj, LV_OPA_30, st);
+    }
+}
+
 lv_obj_t* createListRow(Context* ctx, uint64_t key) {
     auto* row = lv_list_add_button(ctx->list, nullptr, "");
     lv_obj_clean(row);
+    applyFocusStyle(row);
     lv_obj_set_height(row, LIST_ROW_HEIGHT);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -1917,6 +1974,7 @@ void onSelectClientForDeauth(lv_event_t* event) {
 lv_obj_t* createClientRow(Context* ctx) {
     auto* row = lv_list_add_button(ctx->clientsList, nullptr, "");
     lv_obj_clean(row);
+    applyFocusStyle(row);
     lv_obj_set_height(row, CLIENT_ROW_HEIGHT);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -2085,6 +2143,7 @@ lv_obj_t* createIconButton(lv_obj_t* parent, const char* icon, lv_event_cb_t cal
     auto* button = lv_button_create(parent);
     lv_obj_set_size(button, size, size);
     lv_obj_set_style_pad_all(button, 0, 0);
+    applyFocusStyle(button);
     auto* label = lv_label_create(button);
     lv_label_set_text(label, icon);
     lv_obj_center(label);
@@ -2094,6 +2153,7 @@ lv_obj_t* createIconButton(lv_obj_t* parent, const char* icon, lv_event_cb_t cal
 
 lv_obj_t* createSectionCard(lv_obj_t* parent, const char* titleText) {
     auto* card = lv_button_create(parent);
+    applyFocusStyle(card);
     lv_obj_set_width(card, LV_PCT(100));
     lv_obj_set_height(card, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
@@ -2166,16 +2226,19 @@ void updateEvilTwinDetailPage(Context* ctx) {
                     sta_list.sta[i].mac[3], sta_list.sta[i].mac[4], sta_list.sta[i].mac[5]);
                 
                 auto* row = lv_list_add_button(ctx->etClientsList, LV_SYMBOL_WARNING, macStr);
+                applyFocusStyle(row);
                 lv_obj_set_height(row, 30);
             }
             if (sta_list.num == 0) {
                 auto* row = lv_list_add_button(ctx->etClientsList, nullptr, "Nessun client agganciato");
+                applyFocusStyle(row);
                 lv_obj_set_height(row, 30);
             }
         }
     } else {
         lv_obj_clean(ctx->etClientsList);
         auto* row = lv_list_add_button(ctx->etClientsList, nullptr, "Evil Twin non attivo");
+        applyFocusStyle(row);
         lv_obj_set_height(row, 30);
     }
 #else
@@ -2202,6 +2265,7 @@ void createEvilTwinDetailPage(Context* ctx, lv_obj_t* parent) {
     lv_obj_set_width(ctx->etStatusLabel, LV_PCT(100));
 
     ctx->etLogToggleButton = lv_button_create(scroll);
+    applyFocusStyle(ctx->etLogToggleButton);
     lv_obj_set_width(ctx->etLogToggleButton, LV_PCT(100));
     lv_obj_set_height(ctx->etLogToggleButton, LV_SIZE_CONTENT);
     lv_obj_set_style_pad_ver(ctx->etLogToggleButton, 6, 0);
@@ -2271,6 +2335,7 @@ void createDetailPage(Context* ctx, lv_obj_t* parent) {
 
     // 1. Client associati (48%)
     ctx->detailClientsButton = lv_button_create(gridContainer);
+    applyFocusStyle(ctx->detailClientsButton);
     lv_obj_set_width(ctx->detailClientsButton, LV_PCT(48));
     lv_obj_set_height(ctx->detailClientsButton, LV_SIZE_CONTENT);
     lv_obj_set_style_pad_ver(ctx->detailClientsButton, 6, 0);
@@ -2288,6 +2353,7 @@ void createDetailPage(Context* ctx, lv_obj_t* parent) {
     if (isCaptureSupported()) {
         // 2. Channel Lock (48%)
         ctx->detailLockButton = lv_button_create(gridContainer);
+        applyFocusStyle(ctx->detailLockButton);
         lv_obj_set_width(ctx->detailLockButton, LV_PCT(48));
         lv_obj_set_height(ctx->detailLockButton, LV_SIZE_CONTENT);
         lv_obj_set_style_pad_ver(ctx->detailLockButton, 6, 0);
@@ -2304,6 +2370,7 @@ void createDetailPage(Context* ctx, lv_obj_t* parent) {
 
         // 3. Deauth ALL (48%)
         ctx->detailDeauthButton = lv_button_create(gridContainer);
+        applyFocusStyle(ctx->detailDeauthButton);
         lv_obj_set_width(ctx->detailDeauthButton, LV_PCT(48));
         lv_obj_set_height(ctx->detailDeauthButton, LV_SIZE_CONTENT);
         lv_obj_set_style_pad_ver(ctx->detailDeauthButton, 6, 0);
@@ -2320,6 +2387,7 @@ void createDetailPage(Context* ctx, lv_obj_t* parent) {
 
         // 4. Trigger PMKID (48%)
         ctx->detailPmkidButton = lv_button_create(gridContainer);
+        applyFocusStyle(ctx->detailPmkidButton);
         lv_obj_set_width(ctx->detailPmkidButton, LV_PCT(48));
         lv_obj_set_height(ctx->detailPmkidButton, LV_SIZE_CONTENT);
         lv_obj_set_style_pad_ver(ctx->detailPmkidButton, 6, 0);
@@ -2367,6 +2435,7 @@ void createDetailPage(Context* ctx, lv_obj_t* parent) {
     if (isCaptureSupported()) {
         // 5. Evil Twin (48%)
         ctx->detailEvilTwinButton = lv_button_create(etGridContainer);
+        applyFocusStyle(ctx->detailEvilTwinButton);
         lv_obj_set_width(ctx->detailEvilTwinButton, LV_PCT(48));
         lv_obj_set_height(ctx->detailEvilTwinButton, LV_SIZE_CONTENT);
         lv_obj_set_style_pad_ver(ctx->detailEvilTwinButton, 6, 0);
@@ -2403,6 +2472,7 @@ void createDetailPage(Context* ctx, lv_obj_t* parent) {
 
         // 6. Dettagli ET (48% - accanto a Evil Twin)
         ctx->detailEvilTwinDetailsButton = lv_button_create(etGridContainer);
+        applyFocusStyle(ctx->detailEvilTwinDetailsButton);
         lv_obj_set_width(ctx->detailEvilTwinDetailsButton, LV_PCT(48));
         lv_obj_set_height(ctx->detailEvilTwinDetailsButton, LV_SIZE_CONTENT);
         lv_obj_set_style_pad_ver(ctx->detailEvilTwinDetailsButton, 6, 0);
@@ -2450,6 +2520,7 @@ void createDetailPage(Context* ctx, lv_obj_t* parent) {
 
     // 3. Pulsante Connetti in fondo
     ctx->connectButton = lv_button_create(scroll);
+    applyFocusStyle(ctx->connectButton);
     lv_obj_set_width(ctx->connectButton, LV_PCT(100));
     lv_obj_set_height(ctx->connectButton, LV_SIZE_CONTENT);
     lv_obj_set_style_pad_ver(ctx->connectButton, 8, 0);

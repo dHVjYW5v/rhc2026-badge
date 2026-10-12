@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include <app/event.h>
 #include <app/manager.h>
 #include <app/manifest.h>
@@ -23,7 +24,7 @@ void onBackPressed(lv_event_t* event) {
     app_event_emit_close(ctx->appInstanceId);
 }
 
-void onLaunchNetWhisperer(lv_event_t* event) {
+void onLaunchNetWhisperer(lv_event_t*) {
     uint32_t id = 0;
     app_manager_start("WifiScanner", &id);
 }
@@ -34,7 +35,7 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(parent, 0, LV_STATE_DEFAULT);
 
-    auto* toolbar = lvgl_toolbar_create(parent, "Hacking");
+    auto* toolbar = lvgl_toolbar_create(parent, "Hacking Tools");
     lvgl_toolbar_set_nav_action(toolbar, LV_SYMBOL_CLOSE, onBackPressed, ctx);
 
     lv_obj_t* list = lv_list_create(parent);
@@ -44,9 +45,11 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     // Primary tool: NetWhisperer
     lv_obj_t* btn1 = lv_list_add_button(list, LV_SYMBOL_WIFI, "NetWhisperer (Wi-Fi Recon & Sniffer)");
     lv_obj_add_event_cb(btn1, onLaunchNetWhisperer, LV_EVENT_SHORT_CLICKED, nullptr);
-    
-    // Auto focus the button for easy 1-click launch
-    lv_group_focus_obj(btn1);
+
+    // Placeholders for modular expansions
+    lv_list_add_button(list, LV_SYMBOL_AUDIO, "Sub-GHz RF (CC1101 / Standby)");
+    lv_list_add_button(list, LV_SYMBOL_GPS, "GPS Wardriving (NMEA / Standby)");
+    lv_list_add_button(list, LV_SYMBOL_SD_CARD, "RFID / NFC (RC522 / Standby)");
 }
 
 int32_t appMain(int argc, char* argv[]) {
@@ -87,9 +90,9 @@ extern const ::AppManifest manifest = {
     .id = "tactility.hacking",
     .name = "Hacking",
     .category = APP_CATEGORY_USER,
-    .location = { .type = APP_LOCATION_MEMORY, .location = reinterpret_cast<void*>(appMain) },
+    .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) },
     .flags = 0,
-    .stack = { .depth = 2400, .desired_memory_capability = 0 }
+    .stack = { .depth = 0, .desired_memory_capability = 0 }
 };
 
 } // namespace tt::app::hacking

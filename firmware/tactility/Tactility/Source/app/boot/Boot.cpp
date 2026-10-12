@@ -201,7 +201,7 @@ std::string getLauncherAppId() {
     return boot_properties.launcherAppId;
 }
 
-int getSmallestDimension() {
+[[maybe_unused]] int getSmallestDimension() {
     auto* display = lv_display_get_default();
     int width = lv_display_get_horizontal_resolution(display);
     int height = lv_display_get_vertical_resolution(display);
@@ -221,25 +221,8 @@ void createSplashWidgets(lv_obj_t* root, void*) {
     lv_obj_set_style_border_width(root, 0, LV_STATE_DEFAULT);
     lv_obj_set_style_radius(root, 0, LV_STATE_DEFAULT);
 
-    // TODO: Replace with automatic asset buckets like on Android
     if (isUsbBootSplash) {
         lv_obj_align(createLogo(root, "logo_usb.png"), LV_ALIGN_CENTER, 0, 0);
-    } else if (getSmallestDimension() < 150) { // e.g. Cardputer
-        lv_obj_align(createLogo(root, "logo_small.png"), LV_ALIGN_CENTER, 0, 0);
-    } else {
-        // The event and community logos stack as one centred block, so the pair stays centred
-        // together regardless of the individual asset heights.
-        auto* column = lv_obj_create(root);
-        lv_obj_remove_style_all(column);
-        lv_obj_set_size(column, LV_PCT(100), LV_SIZE_CONTENT);
-        lv_obj_align(column, LV_ALIGN_CENTER, 0, 0);
-        lv_obj_set_flex_flow(column, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_flex_align(column, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_row(column, 8, LV_STATE_DEFAULT);
-        createLogo(column, "logo_romhack.png");
-        createLogo(column, "logo_cybersaiyan.png");
-
-        lv_obj_align(createLogo(root, "logo_traboda.png"), LV_ALIGN_BOTTOM_MID, 0, -12);
     }
 
 #ifdef ESP_PLATFORM
