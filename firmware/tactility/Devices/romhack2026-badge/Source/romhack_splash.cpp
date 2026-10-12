@@ -8,10 +8,24 @@
 
 #include <cstdlib>
 #include <cstring>
-#include <miniz.h>
 #include <esp_random.h>
 
 #define TAG "RomhackSplash"
+
+extern "C" {
+struct LodePNGDecompressSettings {
+    unsigned ignore_adler32;
+    unsigned ignore_nlen;
+    size_t max_output_size;
+    unsigned (*custom_zlib)(unsigned char**, size_t*, const unsigned char*, size_t, const struct LodePNGDecompressSettings*);
+    unsigned (*custom_inflate)(unsigned char**, size_t*, const unsigned char*, size_t, const struct LodePNGDecompressSettings*);
+    const void* custom_context;
+};
+extern const struct LodePNGDecompressSettings lodepng_default_decompress_settings;
+unsigned lodepng_zlib_decompress(unsigned char** out, size_t* outsize,
+                                 const unsigned char* in, size_t insize,
+                                 const struct LodePNGDecompressSettings* settings);
+}
 
 namespace {
 
@@ -52,23 +66,27 @@ extern "C" void romhack_draw_early_splash(void) {
     const auto& item = ROMHACK_SPLASHES[splash_idx];
     LOG_I(TAG, "Drawing bootsplash [%d]: %s", splash_idx, item.name);
 
-    auto* decompressed = static_cast<uint8_t*>(malloc(ROMHACK_SPLASH_RAW_SIZE));
-    if (decompressed != nullptr) {
-        size_t written = tinfl_decompress_mem_to_mem(
-            decompressed,
-            ROMHACK_SPLASH_RAW_SIZE,
-            item.zlib_data,
-            item.zlib_size,
-            TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF
-        );
-        if (written == ROMHACK_SPLASH_RAW_SIZE) {
-            display_draw_bitmap(display, 0, 0, ROMHACK_SPLASH_SCREEN_W, ROMHACK_SPLASH_SCREEN_H, decompressed);
-        } else {
-            LOG_E(TAG, "Failed to decompress splash (written: %zu)", written);
+    unsigned char* decompressed = nullptr;
+    size_t decompressed_size = 0;
+    unsigned err = lodepng_zlib_decompress(
+        &decompressed,
+        &decompressed_size,
+        item.zlib_data,
+        item.zlib_size,
+        &lodepng_default_decompress_settings
+    );
+
+    if (err == 0 && decompressed != nullptr && decompressed_size == ROMHACK_SPLASH_RAW_SIZE) {
+        constexpr int BAND_H = 40;
+        for (int y = 0; y < ROMHACK_SPLASH_SCREEN_H; y += BAND_H) {
+            int h = (y + BAND_H <= ROMHACK_SPLASH_SCREEN_H) ? BAND_H : (ROMHACK_SPLASH_SCREEN_H - y);
+            display_draw_bitmap(display, 0, y, ROMHACK_SPLASH_SCREEN_W, y + h, decompressed + (y * ROMHACK_SPLASH_SCREEN_W * 2));
         }
         free(decompressed);
+        LOG_I(TAG, "Bootsplash drawn successfully");
     } else {
-        LOG_E(TAG, "Out of memory allocating splash buffer");
+        LOG_E(TAG, "Failed to decompress bootsplash, error: %u", err);
+        if (decompressed != nullptr) free(decompressed);
     }
 
     Device* backlight = nullptr;
@@ -80,5 +98,4 @@ extern "C" void romhack_draw_early_splash(void) {
     }
 
     device_put(display);
-    LOG_I(TAG, "Early splash drawn successfully");
 }
