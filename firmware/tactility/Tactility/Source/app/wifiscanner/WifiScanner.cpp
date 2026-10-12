@@ -1716,13 +1716,8 @@ void applyFocusStyle(lv_obj_t* obj) {
     if (obj == nullptr) return;
     const lv_color_t neon = lv_color_hex(0x00FF88);
     for (lv_state_t st : { LV_STATE_FOCUSED, LV_STATE_FOCUS_KEY }) {
-        lv_obj_set_style_outline_width(obj, 2, st);
-        lv_obj_set_style_outline_color(obj, neon, st);
-        lv_obj_set_style_outline_pad(obj, 2, st);
-        lv_obj_set_style_outline_opa(obj, LV_OPA_COVER, st);
-        lv_obj_set_style_border_width(obj, 2, st);
-        lv_obj_set_style_border_color(obj, neon, st);
-        lv_obj_set_style_border_opa(obj, LV_OPA_COVER, st);
+        lv_obj_set_style_outline_width(obj, 0, st);
+        lv_obj_set_style_border_width(obj, 0, st);
         lv_obj_set_style_bg_color(obj, neon, st);
         lv_obj_set_style_bg_opa(obj, LV_OPA_30, st);
     }
@@ -3203,7 +3198,9 @@ extern const ::AppManifest manifest = {
     .id = "WifiScanner",
     .name = "NetWhisperer",
     .category = APP_CATEGORY_SYSTEM,
-    .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) }
+    .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) },
+    .flags = APP_MANIFEST_FLAG_HIDDEN,
+    .stack = { .depth = 0, .desired_memory_capability = 0 }
 };
 
 } // namespace tt::app::wifiscanner

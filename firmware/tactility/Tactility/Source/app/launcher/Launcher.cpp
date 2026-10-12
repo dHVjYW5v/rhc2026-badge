@@ -59,18 +59,13 @@ lv_obj_t* createAppButton(lv_obj_t* parent, UiDensity uiDensity, const void* ima
     lv_obj_set_style_border_width(apps_button, 0, LV_STATE_DEFAULT);
     lv_obj_set_style_radius(apps_button, 8, LV_STATE_DEFAULT);
 
-    // Focused style: distinct high-contrast outline & semitransparent fill
+    // Focused style: semitransparent fill without borders
     const lv_color_t primary = lv_theme_get_color_primary(parent);
     for (lv_state_t st : { LV_STATE_FOCUSED, LV_STATE_FOCUS_KEY }) {
         lv_obj_set_style_bg_color(apps_button, primary, st);
         lv_obj_set_style_bg_opa(apps_button, LV_OPA_30, st);
-        lv_obj_set_style_border_width(apps_button, 2, st);
-        lv_obj_set_style_border_color(apps_button, primary, st);
-        lv_obj_set_style_border_opa(apps_button, LV_OPA_COVER, st);
-        lv_obj_set_style_outline_width(apps_button, 2, st);
-        lv_obj_set_style_outline_color(apps_button, primary, st);
-        lv_obj_set_style_outline_pad(apps_button, 2, st);
-        lv_obj_set_style_outline_opa(apps_button, LV_OPA_COVER, st);
+        lv_obj_set_style_border_width(apps_button, 0, st);
+        lv_obj_set_style_outline_width(apps_button, 0, st);
     }
 
     // Create the icon image
@@ -166,9 +161,8 @@ void createWidgets(lv_obj_t* parent, void*) {
         for (lv_state_t st : { LV_STATE_FOCUSED, LV_STATE_FOCUS_KEY }) {
             lv_obj_set_style_bg_color(power_button, primary, st);
             lv_obj_set_style_bg_opa(power_button, LV_OPA_30, st);
-            lv_obj_set_style_border_width(power_button, 2, st);
-            lv_obj_set_style_border_color(power_button, primary, st);
-            lv_obj_set_style_border_opa(power_button, LV_OPA_COVER, st);
+            lv_obj_set_style_border_width(power_button, 0, st);
+            lv_obj_set_style_outline_width(power_button, 0, st);
         }
         lv_obj_set_style_radius(power_button, 8, LV_STATE_DEFAULT);
 
