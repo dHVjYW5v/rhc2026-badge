@@ -236,6 +236,7 @@ struct Context {
     lv_chart_series_t* series[MAX_SERIES] = {};
     lv_obj_t* scanButton = nullptr;
     lv_obj_t* captureButton = nullptr;
+    lv_obj_t* widsButton = nullptr;
     lv_obj_t* stopButton = nullptr;
     lv_obj_t* listPage = nullptr;
     lv_obj_t* list = nullptr;
@@ -1707,6 +1708,10 @@ void onShowList(lv_event_t* event) {
     showPage(static_cast<Context*>(lv_event_get_user_data(event)), Page::List);
 }
 
+void onShowWidsDetail(lv_event_t* event) {
+    showPage(static_cast<Context*>(lv_event_get_user_data(event)), Page::WidsDetail);
+}
+
 void refreshModeButtons(Context* ctx) {
     RadioMode mode;
     if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
@@ -1762,6 +1767,22 @@ void refreshModeButtons(Context* ctx) {
                     lv_label_set_text(lbl, LV_SYMBOL_EYE_OPEN);
                 }
             }
+        }
+    }
+    if (ctx->widsButton != nullptr) {
+        WidsAttackType threat = ctx->widsActiveThreat.load();
+        if (threat == WidsAttackType::DeauthFlood) {
+            lv_obj_set_style_bg_color(ctx->widsButton, lv_color_hex(0xEF4444), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(ctx->widsButton, lv_color_hex(0xEF4444), LV_STATE_FOCUSED);
+        } else if (threat == WidsAttackType::RogueApClone) {
+            lv_obj_set_style_bg_color(ctx->widsButton, lv_color_hex(0xF97316), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(ctx->widsButton, lv_color_hex(0xF97316), LV_STATE_FOCUSED);
+        } else if (ctx->widsTotalAttacks > 0) {
+            lv_obj_set_style_bg_color(ctx->widsButton, lv_color_hex(0x0D9488), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(ctx->widsButton, lv_color_hex(0x0D9488), LV_STATE_FOCUSED);
+        } else {
+            lv_obj_remove_local_style_prop(ctx->widsButton, LV_STYLE_BG_COLOR, LV_STATE_DEFAULT);
+            lv_obj_remove_local_style_prop(ctx->widsButton, LV_STYLE_BG_COLOR, LV_STATE_FOCUSED);
         }
     }
     if (ctx->stopButton != nullptr) {
@@ -2449,9 +2470,9 @@ void createYAxisLabels(lv_obj_t* chartWrapper) {
     }
 }
 
-lv_obj_t* createIconButton(lv_obj_t* parent, const char* icon, lv_event_cb_t callback, Context* ctx, int size = 40) {
+lv_obj_t* createIconButton(lv_obj_t* parent, const char* icon, lv_event_cb_t callback, Context* ctx, int width = 40, int height = 40) {
     auto* button = lv_button_create(parent);
-    lv_obj_set_size(button, size, size);
+    lv_obj_set_size(button, width, height);
     lv_obj_set_style_pad_all(button, 0, 0);
     applyFocusStyle(button);
     auto* label = lv_label_create(button);
@@ -2461,9 +2482,9 @@ lv_obj_t* createIconButton(lv_obj_t* parent, const char* icon, lv_event_cb_t cal
     return button;
 }
 
-lv_obj_t* createImageButton(lv_obj_t* parent, const void* src, lv_event_cb_t callback, Context* ctx, int size = 40) {
+lv_obj_t* createImageButton(lv_obj_t* parent, const void* src, lv_event_cb_t callback, Context* ctx, int width = 40, int height = 40) {
     auto* button = lv_button_create(parent);
-    lv_obj_set_size(button, size, size);
+    lv_obj_set_size(button, width, height);
     lv_obj_set_style_pad_all(button, 0, 0);
     applyFocusStyle(button);
     auto* img = lv_image_create(button);
@@ -3214,19 +3235,21 @@ void createGraphPage(Context* ctx, lv_obj_t* parent) {
 
     createAxisLabels(leftColumn);
 
-    constexpr int BTN = 40;
+    constexpr int BTN_W = 40;
+    constexpr int BTN_H = 34;
     auto* rightColumn = lv_obj_create(mainRow);
-    lv_obj_set_size(rightColumn, BTN, LV_PCT(100));
+    lv_obj_set_size(rightColumn, BTN_W, LV_PCT(100));
     lv_obj_set_flex_flow(rightColumn, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(rightColumn, 0, 0);
-    lv_obj_set_style_pad_row(rightColumn, 4, 0);
+    lv_obj_set_style_pad_row(rightColumn, 3, 0);
     lv_obj_set_style_border_width(rightColumn, 0, 0);
     lv_obj_remove_flag(rightColumn, LV_OBJ_FLAG_SCROLLABLE);
 
-    ctx->scanButton = createImageButton(rightColumn, &wids_shield_icon, onStartScan, ctx, BTN);
-    ctx->captureButton = createIconButton(rightColumn, LV_SYMBOL_EYE_OPEN, onStartCapture, ctx, BTN);
-    ctx->stopButton = createIconButton(rightColumn, LV_SYMBOL_STOP, onStop, ctx, BTN);
-    createIconButton(rightColumn, LV_SYMBOL_LIST, onShowList, ctx, BTN);
+    ctx->scanButton = createImageButton(rightColumn, &wids_shield_icon, onStartScan, ctx, BTN_W, BTN_H);
+    ctx->captureButton = createIconButton(rightColumn, LV_SYMBOL_EYE_OPEN, onStartCapture, ctx, BTN_W, BTN_H);
+    ctx->widsButton = createIconButton(rightColumn, LV_SYMBOL_WARNING, onShowWidsDetail, ctx, BTN_W, BTN_H);
+    ctx->stopButton = createIconButton(rightColumn, LV_SYMBOL_STOP, onStop, ctx, BTN_W, BTN_H);
+    createIconButton(rightColumn, LV_SYMBOL_LIST, onShowList, ctx, BTN_W, BTN_H);
     refreshModeButtons(ctx);
 }
 
@@ -3596,6 +3619,7 @@ void destroyWidgets(void* userData) {
     for (auto& series : ctx->series) series = nullptr;
     ctx->scanButton = nullptr;
     ctx->captureButton = nullptr;
+    ctx->widsButton = nullptr;
     ctx->stopButton = nullptr;
     ctx->listPage = nullptr;
     ctx->list = nullptr;
