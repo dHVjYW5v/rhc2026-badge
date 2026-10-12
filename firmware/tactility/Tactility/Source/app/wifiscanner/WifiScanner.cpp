@@ -21,12 +21,14 @@
 extern "C" void romhack_keypad_set_media_cb(void (*cb)(uint32_t, bool));
 
 #include "OuiTable.h"
+#include "wids_shield_icon.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <string>
@@ -89,8 +91,33 @@ const uint32_t SERIES_COLORS[MAX_SERIES] = {
     0xFF0000, 0xFF7F00, 0xFFFF00, 0x00FF00, 0x00FFFF, 0x0000FF, 0x8000FF, 0xFF00FF,
 };
 
-enum class Page { Graph, List, Detail, Clients, EvilTwinDetail };
+enum class Page { Graph, List, Detail, Clients, EvilTwinDetail, WidsDetail };
 enum class RadioMode { Stopped, ActiveScan, Capture };
+
+enum class WidsAttackType : uint8_t {
+    None = 0,
+    DeauthFlood = 1,
+    RogueApClone = 2,
+    BeaconSpam = 3,
+};
+
+inline const char* widsAttackToString(WidsAttackType type) {
+    switch (type) {
+        case WidsAttackType::DeauthFlood: return "DEAUTH FLOOD";
+        case WidsAttackType::RogueApClone: return "ROGUE AP CLONE";
+        case WidsAttackType::BeaconSpam: return "BEACON SPAM";
+        default: return "NESSUNA";
+    }
+}
+
+struct WidsEvent {
+    uint32_t timestampMs;
+    WidsAttackType type;
+    char desc[64];
+    uint8_t bssid[6];
+    int channel;
+    uint16_t rate;
+};
 
 uint64_t bssidKey(const uint8_t* bssid) {
     uint64_t key = 0;
@@ -240,7 +267,29 @@ struct Context {
     lv_obj_t* etStatusLabel = nullptr;
     lv_obj_t* etClientsList = nullptr;
     lv_obj_t* etLogToggleButton = nullptr;
+
+    // WIDS Intrusion Detection state & UI
+    std::atomic<bool> widsPcapEnabled{false};
+    std::atomic<bool> widsLogFileEnabled{true};
+    std::atomic<uint32_t> widsDeauthWindowCount{0};
+    std::atomic<uint32_t> widsLastDeauthRate{0};
+    std::atomic<uint32_t> widsPeakDeauthRate{0};
+    uint8_t widsLastAttackedBssid[6] = {};
+    std::atomic<WidsAttackType> widsActiveThreat{WidsAttackType::None};
+    uint32_t widsThreatClearTick = 0;
+    std::deque<WidsEvent> widsEvents;
+    int widsTotalAttacks = 0;
+
+    lv_obj_t* widsDetailPage = nullptr;
+    lv_obj_t* widsDetailScroll = nullptr;
+    lv_obj_t* widsThreatLabel = nullptr;
+    lv_obj_t* widsMetricsLabel = nullptr;
+    lv_obj_t* widsPcapButton = nullptr;
+    lv_obj_t* widsChannelModeButton = nullptr;
+    lv_obj_t* widsLogList = nullptr;
 };
+
+void triggerWidsAlert(Context* ctx, WidsAttackType type, const char* desc, const uint8_t* bssid = nullptr, int channel = 0, uint16_t rate = 0);
 
 #ifdef ESP_PLATFORM
 
@@ -398,6 +447,20 @@ void upsertApFromCapture(Context* ctx, const uint8_t* bssid, const std::string& 
         ap.packetCount = 1;
         ap.pmf = pmf;
         ctx->seen.emplace(key, ap);
+
+        // Check for Rogue AP clone (same SSID, different BSSID, differing security)
+        if (ssidSeen && !ssid.empty()) {
+            for (const auto& [k, existingAp] : ctx->seen) {
+                if (k != key && existingAp.record.ssid[0] != '\0' &&
+                    ssid == existingAp.record.ssid &&
+                    existingAp.record.authentication_type != auth) {
+                    char alertMsg[64];
+                    snprintf(alertMsg, sizeof(alertMsg), "Rogue AP clonato: %s", ssid.c_str());
+                    triggerWidsAlert(ctx, WidsAttackType::RogueApClone, alertMsg, bssid, channel, 1);
+                    break;
+                }
+            }
+        }
     } else {
         SeenAp& ap = it->second;
         if (ssidSeen && ap.record.ssid[0] == '\0') {
@@ -523,6 +586,7 @@ void handleEapol(Context* ctx, const uint8_t* payload, int len, uint8_t subtype,
 }
 
 void logEvilTwinPacket(const uint8_t* payload, int len);
+void logWidsPacket(const uint8_t* payload, int len);
 
 void onPromiscuousPacket(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
@@ -538,6 +602,9 @@ void onPromiscuousPacket(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (ctx->evilTwinLogging.load()) {
         logEvilTwinPacket(payload, len);
     }
+    if (ctx->widsPcapEnabled.load()) {
+        logWidsPacket(payload, len);
+    }
 
     uint16_t fc = payload[0] | (payload[1] << 8);
     uint8_t frameType = (fc >> 2) & 0x3;
@@ -551,7 +618,10 @@ void onPromiscuousPacket(void* buf, wifi_promiscuous_pkt_type_t type) {
     int channel = pkt->rx_ctrl.channel;
 
     if (frameType == 0) {
-        if ((frameSubtype == 8 || frameSubtype == 5) && len >= 24 + 12) {
+        if (frameSubtype == 12 || frameSubtype == 10) { // Deauth (12) o Disassoc (10)
+            ctx->widsDeauthWindowCount.fetch_add(1);
+            memcpy(ctx->widsLastAttackedBssid, addr3, 6);
+        } else if ((frameSubtype == 8 || frameSubtype == 5) && len >= 24 + 12) {
             uint16_t capability = payload[24 + 10] | (payload[24 + 11] << 8);
             std::string ssid;
             bool ssidSeen = false;
@@ -627,6 +697,8 @@ void startCapture(Context* ctx) {
         "wifi_hop", 3072, nullptr, tskIDLE_PRIORITY + 1, nullptr, WIFI_TASK_CORE_ID);
 }
 
+void stopWidsPcapLogging();
+
 void stopCapture(Context* ctx) {
     if (!g_captureRunning.load()) return;
     g_lockChannel.store(0);
@@ -635,7 +707,10 @@ void stopCapture(Context* ctx) {
         vTaskDelay(pdMS_TO_TICKS(20));
     }
     g_captureCtx.store(nullptr);
-    (void)ctx;
+    if (ctx != nullptr && ctx->widsPcapEnabled.load()) {
+        stopWidsPcapLogging();
+        ctx->widsPcapEnabled.store(false);
+    }
 }
 
 bool isCaptureSupported() { return true; }
@@ -817,6 +892,7 @@ void sendAssociationRequestBurst(const uint8_t* bssid, const char* ssid, int cha
 
 // ---- Evil Twin / Rogue AP & PCAP functions ----
 
+static bool g_tactical_mode = false;
 static FILE* g_etPcapFile = nullptr;
 static RecursiveMutex g_etPcapMutex;
 static std::atomic<uint32_t> g_etPacketsLogged{0};
@@ -905,6 +981,129 @@ void logEvilTwinPacket(const uint8_t* payload, int len) {
             }
         }
         g_etPcapMutex.unlock();
+    }
+}
+
+// ---- WIDS Sentinel Intrusion Detection Logging ----
+
+static FILE* g_widsPcapFile = nullptr;
+static RecursiveMutex g_widsPcapMutex;
+static std::atomic<uint32_t> g_widsPacketsLogged{0};
+
+bool startWidsPcapLogging() {
+    if (!g_widsPcapMutex.lock(500 / portTICK_PERIOD_MS)) return false;
+    if (g_widsPcapFile != nullptr) {
+        g_widsPcapMutex.unlock();
+        return true;
+    }
+    mkdir("/sdcard/wifi-scanner", 0777);
+    mkdir("/sdcard/wifi-scanner/wids", 0777);
+    char path[128];
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    if (tv.tv_sec > 1700000000) {
+        struct tm tm_info;
+        localtime_r(&tv.tv_sec, &tm_info);
+        char timeStr[20];
+        strftime(timeStr, sizeof(timeStr), "%Y%m%d_%H%M%S", &tm_info);
+        snprintf(path, sizeof(path), "/sdcard/wifi-scanner/wids/wids_%s.pcap", timeStr);
+    } else {
+        snprintf(path, sizeof(path), "/sdcard/wifi-scanner/wids/wids_%lu.pcap",
+            (unsigned long)(esp_timer_get_time() / 1000000));
+    }
+    g_widsPcapFile = fopen(path, "wb");
+    if (g_widsPcapFile != nullptr) {
+        pcapU32(g_widsPcapFile, 0xA1B2C3D4);
+        pcapU16(g_widsPcapFile, 2); pcapU16(g_widsPcapFile, 4);
+        pcapU32(g_widsPcapFile, 0); pcapU32(g_widsPcapFile, 0);
+        pcapU32(g_widsPcapFile, 65535);
+        pcapU32(g_widsPcapFile, 105);
+        fflush(g_widsPcapFile);
+        g_widsPacketsLogged.store(0);
+        LOG_I(TAG, "WIDS PCAP recording started: %s", path);
+    } else {
+        LOG_E(TAG, "Failed to create WIDS PCAP: %s", path);
+    }
+    g_widsPcapMutex.unlock();
+    return g_widsPcapFile != nullptr;
+}
+
+void stopWidsPcapLogging() {
+    if (!g_widsPcapMutex.lock(500 / portTICK_PERIOD_MS)) return;
+    if (g_widsPcapFile != nullptr) {
+        fflush(g_widsPcapFile);
+        fclose(g_widsPcapFile);
+        g_widsPcapFile = nullptr;
+        LOG_I(TAG, "WIDS PCAP closed. Total packets: %u", (unsigned)g_widsPacketsLogged.load());
+    }
+    g_widsPcapMutex.unlock();
+}
+
+void logWidsPacket(const uint8_t* payload, int len) {
+    if (g_widsPcapFile == nullptr) return;
+    if (g_widsPcapMutex.lock(0)) {
+        if (g_widsPcapFile != nullptr) {
+            pcapRecord(g_widsPcapFile, payload, len);
+            uint32_t count = g_widsPacketsLogged.fetch_add(1) + 1;
+            if ((count % 10) == 0) {
+                fflush(g_widsPcapFile);
+            }
+        }
+        g_widsPcapMutex.unlock();
+    }
+}
+
+void logWidsAttackToSd(const WidsEvent& ev) {
+    mkdir("/sdcard/wifi-scanner", 0777);
+    mkdir("/sdcard/wifi-scanner/wids", 0777);
+    FILE* f = fopen("/sdcard/wifi-scanner/wids/wids_attacks.log", "a");
+    if (f == nullptr) return;
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    char timeStr[32] = "N/A";
+    if (tv.tv_sec > 1700000000) {
+        struct tm tm_info;
+        localtime_r(&tv.tv_sec, &tm_info);
+        strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &tm_info);
+    } else {
+        snprintf(timeStr, sizeof(timeStr), "+%lu s", (unsigned long)(ev.timestampMs / 1000));
+    }
+    fprintf(f, "[%s] [%s] %s | BSSID: %02X:%02X:%02X:%02X:%02X:%02X | Ch: %d | Rate: %u/s\n",
+        timeStr, widsAttackToString(ev.type), ev.desc,
+        ev.bssid[0], ev.bssid[1], ev.bssid[2], ev.bssid[3], ev.bssid[4], ev.bssid[5],
+        ev.channel, (unsigned)ev.rate);
+    fclose(f);
+}
+
+void triggerWidsAlert(Context* ctx, WidsAttackType type, const char* desc, const uint8_t* bssid, int channel, uint16_t rate) {
+    WidsEvent ev{};
+    ev.timestampMs = lv_tick_get();
+    ev.type = type;
+    strlcpy(ev.desc, desc, sizeof(ev.desc));
+    if (bssid != nullptr) memcpy(ev.bssid, bssid, 6);
+    ev.channel = channel;
+    ev.rate = rate;
+
+    if (ctx->mutex.lock(100 / portTICK_PERIOD_MS)) {
+        ctx->widsEvents.push_front(ev);
+        if (ctx->widsEvents.size() > 30) ctx->widsEvents.pop_back();
+        ctx->widsTotalAttacks++;
+        ctx->widsActiveThreat.store(type);
+        ctx->widsThreatClearTick = lv_tick_get() + 3500;
+        ctx->mutex.unlock();
+    }
+
+    if (ctx->widsLogFileEnabled.load()) {
+        logWidsAttackToSd(ev);
+    }
+
+    if (!g_tactical_mode) {
+        namespace np = service::neopixel;
+        if (type == WidsAttackType::DeauthFlood) {
+            np::setActiveColor(255, 0, 0); // Strobe Red
+        } else {
+            np::setActiveColor(255, 120, 0); // Orange
+        }
     }
 }
 
@@ -1060,6 +1259,11 @@ void stopEvilTwinAp() {}
 bool startEvilTwinLogging(const char*) { return false; }
 void stopEvilTwinLogging() {}
 void logEvilTwinPacket(const uint8_t*, int) {}
+bool startWidsPcapLogging() { return false; }
+void stopWidsPcapLogging() {}
+void logWidsPacket(const uint8_t*, int) {}
+void logWidsAttackToSd(const WidsEvent&) {}
+void triggerWidsAlert(Context*, WidsAttackType, const char*, const uint8_t*, int, uint16_t) {}
 
 #endif
 
@@ -1209,6 +1413,20 @@ void mergeActiveScan(Context* ctx, const std::vector<WifiApRecord>& records) {
                 ap.pmf = PmfState::None;
             }
             ctx->seen.emplace(key, ap);
+
+            // WIDS detection: verifica presenza di Rogue AP clonato con sicurezza diversa
+            if (ap.record.ssid[0] != '\0') {
+                for (const auto& [k, existingAp] : ctx->seen) {
+                    if (k != key && existingAp.record.ssid[0] != '\0' &&
+                        strcmp(ap.record.ssid, existingAp.record.ssid) == 0 &&
+                        existingAp.record.authentication_type != ap.record.authentication_type) {
+                        char alertMsg[64];
+                        snprintf(alertMsg, sizeof(alertMsg), "Rogue AP clonato: %s", ap.record.ssid);
+                        triggerWidsAlert(ctx, WidsAttackType::RogueApClone, alertMsg, ap.record.bssid, (int)ap.record.channel, 1);
+                        break;
+                    }
+                }
+            }
         } else {
             SeenAp& ap = it->second;
             ap.record = record;
@@ -1268,7 +1486,6 @@ void restoreLedConfig(Context* ctx) {
     np::setActiveAnimation(ctx->savedAnim);
 }
 
-static bool g_tactical_mode = false;
 static uint8_t g_saved_backlight_duty = 200;
 static Context* g_active_scanner_ctx = nullptr;
 
@@ -1404,8 +1621,8 @@ void updateLeds(Context* ctx) {
     }
 
     np::setActiveColorMode(np::ColorMode::Static);
-    if (view == 0) np::setActiveColor(0, 255, 0);
-    else np::setActiveColor(255, 0, 0);
+    if (view == 0) np::setActiveColor(0, 180, 180); // WIDS mode: Teal
+    else np::setActiveColor(220, 38, 38);          // HOP mode: Rosso come in precedenza
     np::setActiveSpeed(2);
     np::setActiveAnimation(np::Animation::Scanner);
 }
@@ -1413,6 +1630,7 @@ void updateLeds(Context* ctx) {
 void showPage(Context* ctx, Page page);
 void updateViews(Context* ctx);
 void updateEvilTwinDetailPage(Context* ctx);
+void updateWidsDetailPage(Context* ctx);
 
 void updateGraph(Context* ctx, const std::vector<SeenAp>& aps) {
     if (ctx->chart == nullptr) return;
@@ -1499,22 +1717,22 @@ void refreshModeButtons(Context* ctx) {
     }
     if (ctx->scanButton != nullptr) {
         if (mode == RadioMode::ActiveScan) {
-            lv_obj_add_state(ctx->scanButton, LV_STATE_DISABLED);
-            lv_obj_set_style_bg_color(ctx->scanButton, lv_color_hex(0x16A34A), LV_STATE_DEFAULT);
-            lv_obj_set_style_bg_color(ctx->scanButton, lv_color_hex(0x16A34A), LV_STATE_DISABLED);
+            lv_obj_remove_state(ctx->scanButton, LV_STATE_DISABLED);
+            lv_obj_set_style_bg_color(ctx->scanButton, lv_color_hex(0x0D9488), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(ctx->scanButton, lv_color_hex(0x0D9488), LV_STATE_FOCUSED);
         } else {
             lv_obj_remove_state(ctx->scanButton, LV_STATE_DISABLED);
             lv_obj_remove_local_style_prop(ctx->scanButton, LV_STYLE_BG_COLOR, LV_STATE_DEFAULT);
-            lv_obj_remove_local_style_prop(ctx->scanButton, LV_STYLE_BG_COLOR, LV_STATE_DISABLED);
+            lv_obj_remove_local_style_prop(ctx->scanButton, LV_STYLE_BG_COLOR, LV_STATE_FOCUSED);
         }
     }
     if (ctx->captureButton != nullptr) {
         int lock = getCaptureLockChannel();
         bool isLocked = (lock >= 1 && lock <= 13);
-        if (mode == RadioMode::Capture || !isCaptureSupported()) {
-            lv_obj_add_state(ctx->captureButton, LV_STATE_DISABLED);
+        if (mode == RadioMode::Capture) {
+            lv_obj_remove_state(ctx->captureButton, LV_STATE_DISABLED);
             lv_obj_set_style_bg_color(ctx->captureButton, lv_color_hex(0xDC2626), LV_STATE_DEFAULT);
-            lv_obj_set_style_bg_color(ctx->captureButton, lv_color_hex(0xDC2626), LV_STATE_DISABLED);
+            lv_obj_set_style_bg_color(ctx->captureButton, lv_color_hex(0xDC2626), LV_STATE_FOCUSED);
             lv_obj_t* lbl = lv_obj_get_child(ctx->captureButton, 0);
             if (lbl != nullptr) {
                 if (isLocked) {
@@ -1525,9 +1743,14 @@ void refreshModeButtons(Context* ctx) {
                     lv_label_set_text(lbl, LV_SYMBOL_EYE_OPEN);
                 }
             }
+        } else if (!isCaptureSupported()) {
+            lv_obj_add_state(ctx->captureButton, LV_STATE_DISABLED);
+            lv_obj_set_style_bg_color(ctx->captureButton, lv_color_hex(0x3F3F46), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(ctx->captureButton, lv_color_hex(0x3F3F46), LV_STATE_DISABLED);
         } else {
             lv_obj_remove_state(ctx->captureButton, LV_STATE_DISABLED);
             lv_obj_remove_local_style_prop(ctx->captureButton, LV_STYLE_BG_COLOR, LV_STATE_DEFAULT);
+            lv_obj_remove_local_style_prop(ctx->captureButton, LV_STYLE_BG_COLOR, LV_STATE_FOCUSED);
             lv_obj_remove_local_style_prop(ctx->captureButton, LV_STYLE_BG_COLOR, LV_STATE_DISABLED);
             lv_obj_t* lbl = lv_obj_get_child(ctx->captureButton, 0);
             if (lbl != nullptr) {
@@ -1572,25 +1795,32 @@ void setMode(Context* ctx, RadioMode mode) {
             lv_obj_set_style_bg_color(ctx->modeBadge, lv_color_hex(0x282828), 0);
             lv_obj_set_style_text_color(ctx->modeBadgeLabel, lv_color_hex(0x888888), 0);
         }
-        if (ctx->statusLabel != nullptr) lv_label_set_text(ctx->statusLabel, "Capture stopped");
+        if (ctx->statusLabel != nullptr) lv_label_set_text(ctx->statusLabel, "Scansione arrestata");
         lvgl_unlock();
     } else if (mode == RadioMode::ActiveScan) {
         lvgl_lock();
         if (ctx->modeBadgeLabel != nullptr) {
-            lv_label_set_text(ctx->modeBadgeLabel, "SCAN");
-            lv_obj_set_style_bg_color(ctx->modeBadge, lv_color_hex(0x16A34A), 0);
+            lv_label_set_text(ctx->modeBadgeLabel, "WIDS");
+            lv_obj_set_style_bg_color(ctx->modeBadge, lv_color_hex(0x0D9488), 0); // Teal
             lv_obj_set_style_text_color(ctx->modeBadgeLabel, lv_color_white(), 0);
         }
-        if (ctx->statusLabel != nullptr) lv_label_set_text(ctx->statusLabel, "Active scan running");
+        if (ctx->statusLabel != nullptr) lv_label_set_text(ctx->statusLabel, "WIDS Sentinel attiva");
         lvgl_unlock();
     } else if (mode == RadioMode::Capture) {
         lvgl_lock();
         if (ctx->modeBadgeLabel != nullptr) {
-            lv_label_set_text(ctx->modeBadgeLabel, "HOP");
-            lv_obj_set_style_bg_color(ctx->modeBadge, lv_color_hex(0xDC2626), 0);
+            int lock = getCaptureLockChannel();
+            if (lock >= 1 && lock <= 13) {
+                char bBuf[16];
+                snprintf(bBuf, sizeof(bBuf), "LOCK %d", lock);
+                lv_label_set_text(ctx->modeBadgeLabel, bBuf);
+            } else {
+                lv_label_set_text(ctx->modeBadgeLabel, "HOP");
+            }
+            lv_obj_set_style_bg_color(ctx->modeBadge, lv_color_hex(0xDC2626), 0); // Rosso
             lv_obj_set_style_text_color(ctx->modeBadgeLabel, lv_color_white(), 0);
         }
-        if (ctx->statusLabel != nullptr) lv_label_set_text(ctx->statusLabel, "Capture / Sniff running");
+        if (ctx->statusLabel != nullptr) lv_label_set_text(ctx->statusLabel, "HOP Sniffer attivo");
         lvgl_unlock();
     }
 
@@ -1598,11 +1828,21 @@ void setMode(Context* ctx, RadioMode mode) {
 }
 
 void onStartScan(lv_event_t* event) {
-    setMode(static_cast<Context*>(lv_event_get_user_data(event)), RadioMode::ActiveScan);
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    if (ctx->mode == RadioMode::ActiveScan) {
+        showPage(ctx, Page::WidsDetail);
+    } else {
+        setMode(ctx, RadioMode::ActiveScan);
+    }
 }
 
 void onStartCapture(lv_event_t* event) {
-    setMode(static_cast<Context*>(lv_event_get_user_data(event)), RadioMode::Capture);
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    if (ctx->mode == RadioMode::Capture) {
+        showPage(ctx, Page::WidsDetail);
+    } else {
+        setMode(ctx, RadioMode::Capture);
+    }
 }
 
 void onStop(lv_event_t* event) {
@@ -1615,8 +1855,8 @@ static void onMediaKey(uint32_t key, bool is_long_press) {
     if (g_active_scanner_ctx == nullptr) return;
     auto* ctx = g_active_scanner_ctx;
 
-    if (key == 0x20003 || is_long_press) {
-        // Toggle Tactical Mode
+    if (key == 0x20003 || (key == 0x20000 && is_long_press)) {
+        // Toggle Tactical Mode (Long-press Play)
         setTacticalMode(ctx, !g_tactical_mode);
         return;
     }
@@ -1637,76 +1877,52 @@ static void onMediaKey(uint32_t key, bool is_long_press) {
     }
 
     if (key == 0x20001) {
-        // Prev (<<): step lock channel --
-        int ch = getCaptureLockChannel();
-        if (ch <= 0) {
-            ch = 13;
+        // Prev (<< / CH-)
+        if (is_long_press) {
+            // Long press: sblocca canale e torna a monitorare tutti i canali (hopping 1-13)
+            setCaptureLockChannel(0);
         } else {
-            ch--;
-            if (ch < 1) ch = 13;
+            // Short press: lock canale e sposta indietro (13..1) per fare sentinel
+            int ch = getCaptureLockChannel();
+            if (ch <= 0) {
+                ch = 13;
+            } else {
+                ch--;
+                if (ch < 1) ch = 13;
+            }
+            if (ctx->mode != RadioMode::Capture) setMode(ctx, RadioMode::Capture);
+            setCaptureLockChannel(ch);
         }
-        if (ctx->mode != RadioMode::Capture) setMode(ctx, RadioMode::Capture);
-        setCaptureLockChannel(ch);
         updateLeds(ctx);
         if (ctx->page == Page::Detail) updateDetail(ctx);
-        lvgl_lock();
-        if (ctx->captureButton != nullptr) {
-            lv_obj_t* lbl = lv_obj_get_child(ctx->captureButton, 0);
-            if (lbl != nullptr) {
-                char chBuf[16];
-                snprintf(chBuf, sizeof(chBuf), "CH %d", ch);
-                lv_label_set_text(lbl, chBuf);
-            }
-        }
-        if (ctx->detailLockButton != nullptr) {
-            char lockText[48];
-            snprintf(lockText, sizeof(lockText), LV_SYMBOL_SETTINGS " Lock: CH %d", ch);
-            lv_obj_t* label = lv_obj_get_child(ctx->detailLockButton, 0);
-            if (label != nullptr) lv_label_set_text(label, lockText);
-        }
-        if (ctx->statusLabel != nullptr) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "Channel Lock: CH %d", ch);
-            lv_label_set_text(ctx->statusLabel, buf);
-        }
-        lvgl_unlock();
+        if (ctx->page == Page::WidsDetail) updateWidsDetailPage(ctx);
+        updateViews(ctx);
+        refreshModeButtons(ctx);
         return;
     }
 
     if (key == 0x20002) {
-        // Next (>>): step lock channel ++
-        int ch = getCaptureLockChannel();
-        if (ch <= 0) {
-            ch = 1;
+        // Next (>> / CH+)
+        if (is_long_press) {
+            // Long press: sblocca canale e torna a monitorare tutti i canali (hopping 1-13)
+            setCaptureLockChannel(0);
         } else {
-            ch++;
-            if (ch > 13) ch = 1;
+            // Short press: lock canale e sposta avanti (1..13) per fare sentinel
+            int ch = getCaptureLockChannel();
+            if (ch <= 0) {
+                ch = 1;
+            } else {
+                ch++;
+                if (ch > 13) ch = 1;
+            }
+            if (ctx->mode != RadioMode::Capture) setMode(ctx, RadioMode::Capture);
+            setCaptureLockChannel(ch);
         }
-        if (ctx->mode != RadioMode::Capture) setMode(ctx, RadioMode::Capture);
-        setCaptureLockChannel(ch);
         updateLeds(ctx);
         if (ctx->page == Page::Detail) updateDetail(ctx);
-        lvgl_lock();
-        if (ctx->captureButton != nullptr) {
-            lv_obj_t* lbl = lv_obj_get_child(ctx->captureButton, 0);
-            if (lbl != nullptr) {
-                char chBuf[16];
-                snprintf(chBuf, sizeof(chBuf), "CH %d", ch);
-                lv_label_set_text(lbl, chBuf);
-            }
-        }
-        if (ctx->detailLockButton != nullptr) {
-            char lockText[48];
-            snprintf(lockText, sizeof(lockText), LV_SYMBOL_SETTINGS " Lock: CH %d", ch);
-            lv_obj_t* label = lv_obj_get_child(ctx->detailLockButton, 0);
-            if (label != nullptr) lv_label_set_text(label, lockText);
-        }
-        if (ctx->statusLabel != nullptr) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "Channel Lock: CH %d", ch);
-            lv_label_set_text(ctx->statusLabel, buf);
-        }
-        lvgl_unlock();
+        if (ctx->page == Page::WidsDetail) updateWidsDetailPage(ctx);
+        updateViews(ctx);
+        refreshModeButtons(ctx);
         return;
     }
 }
@@ -2164,6 +2380,7 @@ void goBack(Context* ctx) {
     else if (current == Page::List) showPage(ctx, Page::Graph);
     else if (current == Page::Clients) showPage(ctx, Page::Detail);
     else if (current == Page::EvilTwinDetail) showPage(ctx, Page::Detail);
+    else if (current == Page::WidsDetail) showPage(ctx, Page::Graph);
 }
 
 void onHardwareBack(void* userData) {
@@ -2240,6 +2457,18 @@ lv_obj_t* createIconButton(lv_obj_t* parent, const char* icon, lv_event_cb_t cal
     auto* label = lv_label_create(button);
     lv_label_set_text(label, icon);
     lv_obj_center(label);
+    lv_obj_add_event_cb(button, callback, LV_EVENT_SHORT_CLICKED, ctx);
+    return button;
+}
+
+lv_obj_t* createImageButton(lv_obj_t* parent, const void* src, lv_event_cb_t callback, Context* ctx, int size = 40) {
+    auto* button = lv_button_create(parent);
+    lv_obj_set_size(button, size, size);
+    lv_obj_set_style_pad_all(button, 0, 0);
+    applyFocusStyle(button);
+    auto* img = lv_image_create(button);
+    lv_image_set_src(img, src);
+    lv_obj_center(img);
     lv_obj_add_event_cb(button, callback, LV_EVENT_SHORT_CLICKED, ctx);
     return button;
 }
@@ -2399,6 +2628,225 @@ void createEvilTwinDetailPage(Context* ctx, lv_obj_t* parent) {
     lv_obj_set_width(ctx->etClientsList, LV_PCT(100));
     lv_obj_set_height(ctx->etClientsList, 120);
     lv_obj_set_style_pad_all(ctx->etClientsList, 0, 0);
+}
+
+void updateWidsDetailPage(Context* ctx) {
+    if (ctx->widsDetailPage == nullptr || lv_obj_has_flag(ctx->widsDetailPage, LV_OBJ_FLAG_HIDDEN)) return;
+
+    if (ctx->widsPcapButton != nullptr) {
+        bool pcap = ctx->widsPcapEnabled.load();
+        lv_obj_t* lbl = lv_obj_get_child(ctx->widsPcapButton, 0);
+        if (lbl != nullptr) {
+            lv_label_set_text(lbl, pcap ? LV_SYMBOL_SAVE " PCAP: ON (SD)" : LV_SYMBOL_SAVE " PCAP: OFF");
+        }
+        lv_obj_set_style_bg_color(ctx->widsPcapButton, pcap ? lv_color_hex(0x0D9488) : lv_color_hex(0x181818), 0);
+    }
+
+    if (ctx->widsChannelModeButton != nullptr) {
+        int lock = getCaptureLockChannel();
+        lv_obj_t* lbl = lv_obj_get_child(ctx->widsChannelModeButton, 0);
+        if (lbl != nullptr) {
+            if (lock > 0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), LV_SYMBOL_SETTINGS " LOCK: CH %d", lock);
+                lv_label_set_text(lbl, buf);
+            } else {
+                lv_label_set_text(lbl, LV_SYMBOL_SETTINGS " HOP (1-13)");
+            }
+        }
+        lv_obj_set_style_bg_color(ctx->widsChannelModeButton, lock > 0 ? lv_color_hex(0xD97706) : lv_color_hex(0x181818), 0);
+    }
+
+    if (ctx->widsThreatLabel != nullptr) {
+        WidsAttackType threat = ctx->widsActiveThreat.load();
+        char tBuf[128];
+        if (threat == WidsAttackType::DeauthFlood) {
+            snprintf(tBuf, sizeof(tBuf), "Minaccia: " LV_SYMBOL_WARNING " ATTACCO DEAUTH ATTIVO (%u pkt/s)!",
+                (unsigned)ctx->widsLastDeauthRate.load());
+            lv_obj_set_style_text_color(ctx->widsThreatLabel, lv_color_hex(0xEF4444), 0);
+        } else if (threat == WidsAttackType::RogueApClone) {
+            snprintf(tBuf, sizeof(tBuf), "Minaccia: " LV_SYMBOL_WARNING " ROGUE AP CLONE RILEVATO!");
+            lv_obj_set_style_text_color(ctx->widsThreatLabel, lv_color_hex(0xF97316), 0);
+        } else {
+            snprintf(tBuf, sizeof(tBuf), "Minaccia: " LV_SYMBOL_OK " NESSUNA ANOMALIA");
+            lv_obj_set_style_text_color(ctx->widsThreatLabel, lv_color_hex(0x22C55E), 0);
+        }
+        lv_label_set_text(ctx->widsThreatLabel, tBuf);
+    }
+
+    if (ctx->widsMetricsLabel != nullptr) {
+        int lock = getCaptureLockChannel();
+        char mBuf[160];
+        snprintf(mBuf, sizeof(mBuf),
+            "Canale: %s | Deauth: %u/s (Picco: %u/s)\n"
+            "Totale Allarmi: %d | PCAP salvati: %u pkt",
+            lock > 0 ? ("CH " + std::to_string(lock) + " (Lock)").c_str() : "Hopping (Canali 1-13)",
+            (unsigned)ctx->widsLastDeauthRate.load(),
+            (unsigned)ctx->widsPeakDeauthRate.load(),
+            ctx->widsTotalAttacks,
+            (unsigned)g_widsPacketsLogged.load());
+        lv_label_set_text(ctx->widsMetricsLabel, mBuf);
+    }
+
+    if (ctx->widsLogList != nullptr) {
+        lv_obj_clean(ctx->widsLogList);
+        if (ctx->mutex.lock(50 / portTICK_PERIOD_MS)) {
+            if (ctx->widsEvents.empty()) {
+                auto* emptyBtn = lv_list_add_button(ctx->widsLogList, nullptr, "Nessun incidente registrato.");
+                applyFocusStyle(emptyBtn);
+            } else {
+                for (const auto& ev : ctx->widsEvents) {
+                    char rowText[128];
+                    snprintf(rowText, sizeof(rowText), "[%us fa] %s | ch%d (%u/s)",
+                        (unsigned)((lv_tick_get() - ev.timestampMs) / 1000),
+                        widsAttackToString(ev.type),
+                        ev.channel, (unsigned)ev.rate);
+                    auto* rowBtn = lv_list_add_button(ctx->widsLogList, nullptr, rowText);
+                    applyFocusStyle(rowBtn);
+                    lv_obj_set_style_pad_ver(rowBtn, 4, 0);
+                }
+            }
+            ctx->mutex.unlock();
+        }
+    }
+}
+
+void createWidsDetailPage(Context* ctx, lv_obj_t* parent) {
+    ctx->widsDetailPage = createPage(parent);
+    lv_obj_add_flag(ctx->widsDetailPage, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_pad_all(ctx->widsDetailPage, 2, 0);
+
+    auto* scroll = lv_obj_create(ctx->widsDetailPage);
+    lv_obj_set_width(scroll, LV_PCT(100));
+    lv_obj_set_flex_grow(scroll, 1);
+    lv_obj_set_flex_flow(scroll, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(scroll, 4, 0);
+    lv_obj_set_style_pad_row(scroll, 4, 0);
+    ctx->widsDetailScroll = scroll;
+
+    auto* btnGrid = lv_obj_create(scroll);
+    lv_obj_set_width(btnGrid, LV_PCT(100));
+    lv_obj_set_height(btnGrid, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btnGrid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_all(btnGrid, 0, 0);
+    lv_obj_set_style_pad_column(btnGrid, 4, 0);
+    lv_obj_set_style_pad_row(btnGrid, 4, 0);
+    lv_obj_set_style_border_width(btnGrid, 0, 0);
+    lv_obj_set_style_bg_opa(btnGrid, LV_OPA_TRANSP, 0);
+    lv_obj_remove_flag(btnGrid, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->widsPcapButton = lv_button_create(btnGrid);
+    applyFocusStyle(ctx->widsPcapButton);
+    lv_obj_set_width(ctx->widsPcapButton, LV_PCT(48));
+    lv_obj_set_height(ctx->widsPcapButton, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_ver(ctx->widsPcapButton, 6, 0);
+    lv_obj_set_style_radius(ctx->widsPcapButton, 4, 0);
+    lv_obj_set_style_border_width(ctx->widsPcapButton, 1, 0);
+    lv_obj_set_style_border_color(ctx->widsPcapButton, lv_color_hex(0x505050), 0);
+    lv_obj_set_style_bg_color(ctx->widsPcapButton, lv_color_hex(0x181818), 0);
+    lv_obj_set_style_bg_opa(ctx->widsPcapButton, LV_OPA_COVER, 0);
+    lv_obj_add_flag(ctx->widsPcapButton, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+    auto* pcapLbl = lv_label_create(ctx->widsPcapButton);
+    lv_label_set_text(pcapLbl, LV_SYMBOL_SAVE " PCAP: OFF");
+    lv_obj_center(pcapLbl);
+    lv_obj_add_event_cb(ctx->widsPcapButton, [](lv_event_t* e) {
+        auto* ctx = static_cast<Context*>(lv_event_get_user_data(e));
+        bool en = !ctx->widsPcapEnabled.load();
+        if (en) {
+            if (startWidsPcapLogging()) {
+                ctx->widsPcapEnabled.store(true);
+            }
+        } else {
+            stopWidsPcapLogging();
+            ctx->widsPcapEnabled.store(false);
+        }
+        updateWidsDetailPage(ctx);
+    }, LV_EVENT_CLICKED, ctx);
+
+    ctx->widsChannelModeButton = lv_button_create(btnGrid);
+    applyFocusStyle(ctx->widsChannelModeButton);
+    lv_obj_set_width(ctx->widsChannelModeButton, LV_PCT(48));
+    lv_obj_set_height(ctx->widsChannelModeButton, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_ver(ctx->widsChannelModeButton, 6, 0);
+    lv_obj_set_style_radius(ctx->widsChannelModeButton, 4, 0);
+    lv_obj_set_style_border_width(ctx->widsChannelModeButton, 1, 0);
+    lv_obj_set_style_border_color(ctx->widsChannelModeButton, lv_color_hex(0x505050), 0);
+    lv_obj_set_style_bg_color(ctx->widsChannelModeButton, lv_color_hex(0x181818), 0);
+    lv_obj_set_style_bg_opa(ctx->widsChannelModeButton, LV_OPA_COVER, 0);
+    lv_obj_add_flag(ctx->widsChannelModeButton, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+    auto* chModeLbl = lv_label_create(ctx->widsChannelModeButton);
+    lv_label_set_text(chModeLbl, LV_SYMBOL_SETTINGS " HOP Tutti");
+    lv_obj_center(chModeLbl);
+    lv_obj_add_event_cb(ctx->widsChannelModeButton, [](lv_event_t* e) {
+        auto* ctx = static_cast<Context*>(lv_event_get_user_data(e));
+        int curLock = getCaptureLockChannel();
+        if (curLock <= 0) {
+            setCaptureLockChannel(1);
+        } else {
+            setCaptureLockChannel(0);
+        }
+        updateWidsDetailPage(ctx);
+        updateViews(ctx);
+    }, LV_EVENT_CLICKED, ctx);
+
+    auto* backBtn = lv_button_create(btnGrid);
+    applyFocusStyle(backBtn);
+    lv_obj_set_width(backBtn, LV_PCT(48));
+    lv_obj_set_height(backBtn, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_ver(backBtn, 6, 0);
+    lv_obj_set_style_radius(backBtn, 4, 0);
+    lv_obj_set_style_border_width(backBtn, 1, 0);
+    lv_obj_set_style_border_color(backBtn, lv_color_hex(0x505050), 0);
+    lv_obj_set_style_bg_color(backBtn, lv_color_hex(0x181818), 0);
+    lv_obj_set_style_bg_opa(backBtn, LV_OPA_COVER, 0);
+    lv_obj_add_flag(backBtn, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+    auto* backLbl = lv_label_create(backBtn);
+    lv_label_set_text(backLbl, LV_SYMBOL_LEFT " Grafico");
+    lv_obj_center(backLbl);
+    lv_obj_add_event_cb(backBtn, [](lv_event_t* e) {
+        auto* ctx = static_cast<Context*>(lv_event_get_user_data(e));
+        showPage(ctx, Page::Graph);
+    }, LV_EVENT_CLICKED, ctx);
+
+    auto* clearBtn = lv_button_create(btnGrid);
+    applyFocusStyle(clearBtn);
+    lv_obj_set_width(clearBtn, LV_PCT(48));
+    lv_obj_set_height(clearBtn, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_ver(clearBtn, 6, 0);
+    lv_obj_set_style_radius(clearBtn, 4, 0);
+    lv_obj_set_style_border_width(clearBtn, 1, 0);
+    lv_obj_set_style_border_color(clearBtn, lv_color_hex(0x505050), 0);
+    lv_obj_set_style_bg_color(clearBtn, lv_color_hex(0x181818), 0);
+    lv_obj_set_style_bg_opa(clearBtn, LV_OPA_COVER, 0);
+    lv_obj_add_flag(clearBtn, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+    auto* clearLbl = lv_label_create(clearBtn);
+    lv_label_set_text(clearLbl, LV_SYMBOL_TRASH " Reset Log");
+    lv_obj_center(clearLbl);
+    lv_obj_add_event_cb(clearBtn, [](lv_event_t* e) {
+        auto* ctx = static_cast<Context*>(lv_event_get_user_data(e));
+        if (ctx->mutex.lock(50 / portTICK_PERIOD_MS)) {
+            ctx->widsEvents.clear();
+            ctx->widsTotalAttacks = 0;
+            ctx->widsPeakDeauthRate.store(0);
+            ctx->mutex.unlock();
+        }
+        updateWidsDetailPage(ctx);
+    }, LV_EVENT_CLICKED, ctx);
+
+    auto* threatCard = createSectionCard(scroll, "Stato WIDS Sentinel & Minacce");
+    ctx->widsThreatLabel = lv_label_create(threatCard);
+    lv_obj_set_width(ctx->widsThreatLabel, LV_PCT(100));
+    lv_label_set_long_mode(ctx->widsThreatLabel, LV_LABEL_LONG_MODE_WRAP);
+
+    ctx->widsMetricsLabel = lv_label_create(threatCard);
+    lv_obj_set_width(ctx->widsMetricsLabel, LV_PCT(100));
+    lv_label_set_long_mode(ctx->widsMetricsLabel, LV_LABEL_LONG_MODE_WRAP);
+
+    auto* logCard = createSectionCard(scroll, "Registro Incidenti Rilevati (SD / RAM)");
+    ctx->widsLogList = lv_list_create(logCard);
+    lv_obj_set_width(ctx->widsLogList, LV_PCT(100));
+    lv_obj_set_height(ctx->widsLogList, 110);
+    lv_obj_set_style_pad_all(ctx->widsLogList, 0, 0);
 }
 
 void createDetailPage(Context* ctx, lv_obj_t* parent) {
@@ -2700,6 +3148,11 @@ void createGraphPage(Context* ctx, lv_obj_t* parent) {
     lv_obj_set_style_bg_color(ctx->modeBadge, lv_color_hex(0x282828), 0);
     lv_obj_set_style_bg_opa(ctx->modeBadge, LV_OPA_COVER, 0);
     lv_obj_remove_flag(ctx->modeBadge, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->modeBadge, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(ctx->modeBadge, [](lv_event_t* e) {
+        auto* ctx = static_cast<Context*>(lv_event_get_user_data(e));
+        showPage(ctx, Page::WidsDetail);
+    }, LV_EVENT_CLICKED, ctx);
 
     ctx->modeBadgeLabel = lv_label_create(ctx->modeBadge);
     lv_label_set_text(ctx->modeBadgeLabel, "STOP");
@@ -2770,7 +3223,7 @@ void createGraphPage(Context* ctx, lv_obj_t* parent) {
     lv_obj_set_style_border_width(rightColumn, 0, 0);
     lv_obj_remove_flag(rightColumn, LV_OBJ_FLAG_SCROLLABLE);
 
-    ctx->scanButton = createIconButton(rightColumn, LV_SYMBOL_WIFI, onStartScan, ctx, BTN);
+    ctx->scanButton = createImageButton(rightColumn, &wids_shield_icon, onStartScan, ctx, BTN);
     ctx->captureButton = createIconButton(rightColumn, LV_SYMBOL_EYE_OPEN, onStartCapture, ctx, BTN);
     ctx->stopButton = createIconButton(rightColumn, LV_SYMBOL_STOP, onStop, ctx, BTN);
     createIconButton(rightColumn, LV_SYMBOL_LIST, onShowList, ctx, BTN);
@@ -2819,6 +3272,7 @@ void showPage(Context* ctx, Page page) {
     lv_obj_add_flag(ctx->detailPage, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ctx->clientsPage, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ctx->etDetailPage, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->widsDetailPage != nullptr) lv_obj_add_flag(ctx->widsDetailPage, LV_OBJ_FLAG_HIDDEN);
 
     switch (page) {
         case Page::Graph:
@@ -2852,6 +3306,19 @@ void showPage(Context* ctx, Page page) {
             lv_obj_remove_flag(ctx->etDetailPage, LV_OBJ_FLAG_HIDDEN);
             if (ctx->toolbar != nullptr) lvgl_toolbar_set_title(ctx->toolbar, "Evil Twin Log & Client");
             updateEvilTwinDetailPage(ctx);
+            break;
+        case Page::WidsDetail:
+            if (ctx->widsDetailPage != nullptr) {
+                lv_obj_remove_flag(ctx->widsDetailPage, LV_OBJ_FLAG_HIDDEN);
+                if (ctx->widsDetailScroll != nullptr) {
+                    lv_obj_scroll_to_y(ctx->widsDetailScroll, 0, LV_ANIM_OFF);
+                    if (ctx->widsPcapButton != nullptr) {
+                        lv_group_focus_obj(ctx->widsPcapButton);
+                    }
+                }
+            }
+            if (ctx->toolbar != nullptr) lvgl_toolbar_set_title(ctx->toolbar, "WIDS Sentinel");
+            updateWidsDetailPage(ctx);
             break;
     }
 
@@ -2911,37 +3378,70 @@ void updateViews(Context* ctx) {
             snprintf(statsText, sizeof(statsText), "Wi-Fi in avvio...");
         } else if (mode == RadioMode::Capture) {
 #ifdef ESP_PLATFORM
-            int hs = 0, pmkid = 0;
-            if (ctx->mutex.lock(0)) { hs = ctx->handshakesSaved; pmkid = ctx->pmkidSeen; ctx->mutex.unlock(); }
             int lock = g_lockChannel.load();
-            if (lock >= 1 && lock <= 13) {
+            int hop = g_hopChannel.load();
+            bool isLocked = (lock >= 1 && lock <= 13);
+
+            if (isLocked) {
                 snprintf(badgeText, sizeof(badgeText), "LOCK %d", lock);
-                badgeBg = 0xB91C1C;
-                badgeFg = 0xFFFFFF;
             } else {
-                snprintf(badgeText, sizeof(badgeText), "HOP %d", g_hopChannel.load());
-                badgeBg = 0xDC2626;
-                badgeFg = 0xFFFFFF;
+                snprintf(badgeText, sizeof(badgeText), "HOP");
             }
-            if (pmkid > 0) {
-                snprintf(statsText, sizeof(statsText), "%u AP | %u CLI | HS:%d P:%d",
-                    (unsigned)aps.size(), (unsigned)clientCount, hs, pmkid);
+            badgeBg = 0xDC2626; // Rosso come in precedenza
+            badgeFg = 0xFFFFFF;
+
+            WidsAttackType threat = ctx->widsActiveThreat.load();
+            uint32_t rate = ctx->widsLastDeauthRate.load();
+
+            if (threat == WidsAttackType::DeauthFlood) {
+                snprintf(statsText, sizeof(statsText), "[!] ATTACCO DEAUTH (%u/s) %s",
+                    (unsigned)rate,
+                    isLocked ? ("CH " + std::to_string(lock)).c_str() : ("ch" + std::to_string(hop)).c_str());
+            } else if (threat == WidsAttackType::RogueApClone) {
+                snprintf(statsText, sizeof(statsText), "[!] ATTACCO EVIL TWIN / ROGUE");
             } else {
-                snprintf(statsText, sizeof(statsText), "%u AP | %u CLI | HS:%d",
-                    (unsigned)aps.size(), (unsigned)clientCount, hs);
+                int hs = 0, pmkid = 0;
+                if (ctx->mutex.lock(0)) { hs = ctx->handshakesSaved; pmkid = ctx->pmkidSeen; ctx->mutex.unlock(); }
+                if (pmkid > 0) {
+                    if (isLocked) {
+                        snprintf(statsText, sizeof(statsText), "CH %d | %u AP | %u CLI | HS:%d P:%d",
+                            lock, (unsigned)aps.size(), (unsigned)clientCount, hs, pmkid);
+                    } else {
+                        snprintf(statsText, sizeof(statsText), "ch%d | %u AP | %u CLI | HS:%d P:%d",
+                            hop, (unsigned)aps.size(), (unsigned)clientCount, hs, pmkid);
+                    }
+                } else {
+                    if (isLocked) {
+                        snprintf(statsText, sizeof(statsText), "CH %d | %u AP | %u CLI | HS:%d",
+                            lock, (unsigned)aps.size(), (unsigned)clientCount, hs);
+                    } else {
+                        snprintf(statsText, sizeof(statsText), "ch%d | %u AP | %u CLI | HS:%d",
+                            hop, (unsigned)aps.size(), (unsigned)clientCount, hs);
+                    }
+                }
             }
 #else
-            snprintf(badgeText, sizeof(badgeText), "SIM");
+            snprintf(badgeText, sizeof(badgeText), "HOP");
             badgeBg = 0xDC2626;
             badgeFg = 0xFFFFFF;
             snprintf(statsText, sizeof(statsText), "%u AP | %u CLI", (unsigned)aps.size(), (unsigned)clientCount);
 #endif
         } else if (mode == RadioMode::ActiveScan) {
-            snprintf(badgeText, sizeof(badgeText), "SCAN");
-            badgeBg = 0x16A34A;
+            snprintf(badgeText, sizeof(badgeText), "WIDS");
+            badgeBg = 0x0D9488; // Teal per modalità WIDS
             badgeFg = 0xFFFFFF;
-            snprintf(statsText, sizeof(statsText), "%u AP rilevati%s", (unsigned)aps.size(),
-                service::wifi::isScanning() ? "..." : "");
+
+            WidsAttackType threat = ctx->widsActiveThreat.load();
+            uint32_t rate = ctx->widsLastDeauthRate.load();
+
+            if (threat == WidsAttackType::DeauthFlood) {
+                snprintf(statsText, sizeof(statsText), "[!] ATTACCO DEAUTH (%u/s)", (unsigned)rate);
+            } else if (threat == WidsAttackType::RogueApClone) {
+                snprintf(statsText, sizeof(statsText), "[!] ATTACCO EVIL TWIN / ROGUE");
+            } else {
+                snprintf(statsText, sizeof(statsText), "%u AP rilevati%s", (unsigned)aps.size(),
+                    service::wifi::isScanning() ? "..." : "");
+            }
         } else {
             snprintf(badgeText, sizeof(badgeText), "STOP");
             badgeBg = 0x282828;
@@ -2969,6 +3469,7 @@ void updateViews(Context* ctx) {
     else if (page == Page::Detail) updateDetail(ctx);
     else if (page == Page::Clients) updateClientsPage(ctx);
     else if (page == Page::EvilTwinDetail) updateEvilTwinDetailPage(ctx);
+    else if (page == Page::WidsDetail) updateWidsDetailPage(ctx);
     lvgl_unlock();
 
     updateLeds(ctx);
@@ -2991,7 +3492,25 @@ void onTimer(Context* ctx) {
         service::wifi::scan();
     }
 
-    if (mode == RadioMode::Capture) flushHandshakes(ctx);
+    if (mode == RadioMode::Capture) {
+        flushHandshakes(ctx);
+        uint32_t deauths = ctx->widsDeauthWindowCount.exchange(0);
+        ctx->widsLastDeauthRate.store(deauths);
+        if (deauths > ctx->widsPeakDeauthRate.load()) {
+            ctx->widsPeakDeauthRate.store(deauths);
+        }
+        if (deauths >= 15) {
+            int ch = getCaptureLockChannel();
+            if (ch <= 0) ch = getCurrentRadioChannel();
+            triggerWidsAlert(ctx, WidsAttackType::DeauthFlood, "Deauth Flood Burst", ctx->widsLastAttackedBssid, ch, (uint16_t)deauths);
+        }
+    }
+
+    if (ctx->widsThreatClearTick != 0 && lv_tick_get() > ctx->widsThreatClearTick) {
+        ctx->widsActiveThreat.store(WidsAttackType::None);
+        ctx->widsThreatClearTick = 0;
+        updateLeds(ctx);
+    }
 
     if (window_manager_get_state(ctx->window) == WINDOW_STATE_GRANTED) updateViews(ctx);
 }
@@ -3057,6 +3576,7 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     createDetailPage(ctx, wrapper);
     createClientsPage(ctx, wrapper);
     createEvilTwinDetailPage(ctx, wrapper);
+    createWidsDetailPage(ctx, wrapper);
 
     showPage(ctx, ctx->page);
 }
@@ -3106,6 +3626,13 @@ void destroyWidgets(void* userData) {
     ctx->etStatusLabel = nullptr;
     ctx->etClientsList = nullptr;
     ctx->etLogToggleButton = nullptr;
+    ctx->widsDetailPage = nullptr;
+    ctx->widsDetailScroll = nullptr;
+    ctx->widsThreatLabel = nullptr;
+    ctx->widsMetricsLabel = nullptr;
+    ctx->widsPcapButton = nullptr;
+    ctx->widsChannelModeButton = nullptr;
+    ctx->widsLogList = nullptr;
 }
 
 int32_t appMain(int /*argc*/, char* /*argv*/[]) {
