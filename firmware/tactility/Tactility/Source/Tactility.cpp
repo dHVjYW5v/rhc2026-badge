@@ -95,6 +95,7 @@
 #ifdef CONFIG_TT_EARLY_SPLASH
 // Provided by the device project (Devices/<id>/Source), which only builds for that device.
 extern "C" void romhack_draw_early_splash(void);
+extern "C" void romhack_wait_splash_duration(uint32_t duration_ms);
 #endif
 
 namespace tt {
@@ -620,6 +621,9 @@ void run(Module* const dtsModules[], const DtsDevice dtsDevices[]) {
         .task_affinity = getCpuAffinityConfiguration().graphics
 #endif
     });
+#ifdef CONFIG_TT_EARLY_SPLASH
+    romhack_wait_splash_duration(4000);
+#endif
     check(module_ensure_started(&lvgl_module) == ERROR_NONE);
 
     LOG_I(TAG, "Core systems ready");

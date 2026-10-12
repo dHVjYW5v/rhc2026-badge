@@ -9,8 +9,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <esp_random.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #define TAG "RomhackSplash"
+
+static TickType_t g_splash_start_tick = 0;
 
 extern "C" {
 struct LodePNGDecompressSettings {
@@ -98,4 +102,19 @@ extern "C" void romhack_draw_early_splash(void) {
     }
 
     device_put(display);
+
+    g_splash_start_tick = xTaskGetTickCount();
+}
+
+extern "C" void romhack_wait_splash_duration(uint32_t duration_ms) {
+    if (g_splash_start_tick == 0) {
+        return;
+    }
+    TickType_t now = xTaskGetTickCount();
+    TickType_t duration_ticks = pdMS_TO_TICKS(duration_ms);
+    TickType_t elapsed = now - g_splash_start_tick;
+    if (elapsed < duration_ticks) {
+        LOG_I(TAG, "Holding splash on screen for remaining %lu ms", (unsigned long)((duration_ticks - elapsed) * portTICK_PERIOD_MS));
+        vTaskDelay(duration_ticks - elapsed);
+    }
 }
