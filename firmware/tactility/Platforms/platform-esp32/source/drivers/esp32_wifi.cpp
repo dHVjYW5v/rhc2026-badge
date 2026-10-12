@@ -242,6 +242,15 @@ error_t bring_up_wifi(Esp32WifiCtx* ctx) {
 
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
 
+    wifi_country_t country = {
+        .cc = "IT",
+        .schan = 1,
+        .nchan = 13,
+        .max_tx_power = 20,
+        .policy = WIFI_COUNTRY_POLICY_MANUAL
+    };
+    esp_wifi_set_country(&country);
+
     err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &on_wifi_or_ip_event, ctx, &ctx->wifiEventHandler);
     if (err != ESP_OK) {
         LOG_E(TAG, "Failed to register WIFI_EVENT handler: %s", esp_err_to_name(err));

@@ -516,6 +516,16 @@ constexpr int HOP_SEQUENCE[] = {1, 6, 11, 3, 8, 13, 2, 7, 1, 6, 11, 4, 9, 5, 10,
 constexpr int HOP_SEQUENCE_LEN = sizeof(HOP_SEQUENCE) / sizeof(HOP_SEQUENCE[0]);
 
 int32_t hopTask(void* /*arg*/) {
+#ifdef ESP_PLATFORM
+    wifi_country_t country = {
+        .cc = "IT",
+        .schan = 1,
+        .nchan = 13,
+        .max_tx_power = 20,
+        .policy = WIFI_COUNTRY_POLICY_MANUAL
+    };
+    esp_wifi_set_country(&country);
+#endif
     esp_wifi_set_promiscuous_rx_cb(&onPromiscuousPacket);
     wifi_promiscuous_filter_t filter{};
     filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
@@ -3023,6 +3033,16 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
 
     service::wifi::setScanRecords(MAX_RECORDS);
     service::wifi::setAutoScanPaused(true);
+#ifdef ESP_PLATFORM
+    wifi_country_t country = {
+        .cc = "IT",
+        .schan = 1,
+        .nchan = 13,
+        .max_tx_power = 20,
+        .policy = WIFI_COUNTRY_POLICY_MANUAL
+    };
+    esp_wifi_set_country(&country);
+#endif
 
     saveLedConfig(&ctx);
 
