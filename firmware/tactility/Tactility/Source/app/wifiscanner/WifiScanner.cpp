@@ -100,6 +100,21 @@ uint64_t bssidKey(const uint8_t* bssid) {
 
 uint64_t nowMs() { return (uint64_t)lv_tick_get(); }
 
+enum class PmfState : uint8_t {
+    None = 0,       // Assente
+    Capable = 1,    // Facoltativo (MFPC=1, MFPR=0)
+    Required = 2,   // Obbligatorio (MFPC=1, MFPR=1)
+};
+
+const char* pmfToString(PmfState pmf) {
+    switch (pmf) {
+        case PmfState::Required: return "Obbligatorio (Protetto)";
+        case PmfState::Capable:  return "Facoltativo (Compatibilita)";
+        case PmfState::None:
+        default:                 return "Assente (Vulnerabile Deauth)";
+    }
+}
+
 struct SeenAp {
     WifiApRecord record{};
     uint64_t firstSeenMs = 0;
@@ -109,6 +124,7 @@ struct SeenAp {
     bool fromCapture = false;
     uint32_t packetCount = 0;
     int colorIndex = 0;
+    PmfState pmf = PmfState::None;
 };
 
 constexpr int HS_MAX_APS = 16;
@@ -209,6 +225,7 @@ struct Context {
     lv_obj_t* detailSsidLabel = nullptr;
     lv_obj_t* detailMacLabel = nullptr;
     lv_obj_t* detailSecLabel = nullptr;
+    lv_obj_t* detailPmfLabel = nullptr;
     lv_obj_t* detailChanLabel = nullptr;
     lv_obj_t* detailPowerLabel = nullptr;
     lv_obj_t* detailPhyLabel = nullptr;
@@ -236,10 +253,13 @@ std::atomic<int> g_lockChannel{0};
 std::string macToString(const uint8_t* mac);
 
 void parseBeaconIes(const uint8_t* ies, int iesLen, uint16_t capability,
-    std::string& ssidOut, bool& ssidSeen, WifiAuthenticationType& authOut) {
+    std::string& ssidOut, bool& ssidSeen, WifiAuthenticationType& authOut, PmfState& pmfOut) {
     bool privacy = (capability & 0x0010) != 0;
     bool hasRsn = false;
     bool hasWpa = false;
+    bool hasSae = false;
+    bool hasPsk = false;
+    pmfOut = PmfState::None;
     ssidSeen = false;
     int i = 0;
     while (i + 2 <= iesLen) {
@@ -252,16 +272,55 @@ void parseBeaconIes(const uint8_t* ies, int iesLen, uint16_t capability,
             ssidSeen = len > 0;
         } else if (tag == 48) {
             hasRsn = true;
+            if (len >= 8) {
+                int offset = 6; // skip Version (2) + Group Cipher (4)
+                uint16_t pairwise_count = data[offset] | (data[offset + 1] << 8);
+                offset += 2 + pairwise_count * 4;
+                if (offset + 2 <= len) {
+                    uint16_t akm_count = data[offset] | (data[offset + 1] << 8);
+                    offset += 2;
+                    for (uint16_t k = 0; k < akm_count && offset + 4 <= len; k++, offset += 4) {
+                        if (data[offset] == 0x00 && data[offset + 1] == 0x0F && data[offset + 2] == 0xAC) {
+                            uint8_t akm_type = data[offset + 3];
+                            if (akm_type == 2) hasPsk = true;
+                            else if (akm_type == 8 || akm_type == 18) hasSae = true;
+                        }
+                    }
+                    if (offset + 2 <= len) {
+                        uint16_t rsn_cap = data[offset] | (data[offset + 1] << 8);
+                        bool mfpc = (rsn_cap & (1 << 6)) != 0;
+                        bool mfpr = (rsn_cap & (1 << 7)) != 0;
+                        if (mfpr) {
+                            pmfOut = PmfState::Required;
+                        } else if (mfpc) {
+                            pmfOut = PmfState::Capable;
+                        } else {
+                            pmfOut = PmfState::None;
+                        }
+                    }
+                }
+            }
         } else if (tag == 221 && len >= 4 && data[0] == 0x00 && data[1] == 0x50 && data[2] == 0xF2 && data[3] == 0x01) {
             hasWpa = true;
         }
         i += 2 + len;
     }
-    if (!privacy) authOut = WIFI_AUTHENTICATION_TYPE_OPEN;
-    else if (hasRsn && hasWpa) authOut = WIFI_AUTHENTICATION_TYPE_WPA_WPA2_PSK;
-    else if (hasRsn) authOut = WIFI_AUTHENTICATION_TYPE_WPA2_PSK;
-    else if (hasWpa) authOut = WIFI_AUTHENTICATION_TYPE_WPA_PSK;
-    else authOut = WIFI_AUTHENTICATION_TYPE_WEP;
+    if (!privacy) {
+        authOut = WIFI_AUTHENTICATION_TYPE_OPEN;
+        pmfOut = PmfState::None;
+    } else if (hasSae && (hasPsk || hasWpa || pmfOut == PmfState::Capable)) {
+        authOut = WIFI_AUTHENTICATION_TYPE_WPA2_WPA3_PSK;
+    } else if (hasSae) {
+        authOut = WIFI_AUTHENTICATION_TYPE_WPA3_PSK;
+    } else if (hasRsn && hasWpa) {
+        authOut = WIFI_AUTHENTICATION_TYPE_WPA_WPA2_PSK;
+    } else if (hasRsn) {
+        authOut = WIFI_AUTHENTICATION_TYPE_WPA2_PSK;
+    } else if (hasWpa) {
+        authOut = WIFI_AUTHENTICATION_TYPE_WPA_PSK;
+    } else {
+        authOut = WIFI_AUTHENTICATION_TYPE_WEP;
+    }
 }
 
 std::string parseProbeRequestSsid(const uint8_t* ies, int iesLen) {
@@ -313,7 +372,7 @@ void sanitizeAscii(char* str) {
 }
 
 void upsertApFromCapture(Context* ctx, const uint8_t* bssid, const std::string& ssid, bool ssidSeen,
-    int channel, int8_t rssi, WifiAuthenticationType auth) {
+    int channel, int8_t rssi, WifiAuthenticationType auth, PmfState pmf) {
     if (!ctx->mutex.lock(0)) return;
     uint64_t key = bssidKey(bssid);
     uint64_t now = nowMs();
@@ -337,6 +396,7 @@ void upsertApFromCapture(Context* ctx, const uint8_t* bssid, const std::string& 
         ap.fromCapture = true;
         ap.colorIndex = ctx->nextColor++ % MAX_SERIES;
         ap.packetCount = 1;
+        ap.pmf = pmf;
         ctx->seen.emplace(key, ap);
     } else {
         SeenAp& ap = it->second;
@@ -353,6 +413,7 @@ void upsertApFromCapture(Context* ctx, const uint8_t* bssid, const std::string& 
         ap.rssiMin = std::min(ap.rssiMin, rssi);
         ap.rssiMax = std::max(ap.rssiMax, rssi);
         if (ap.fromCapture) ap.record.authentication_type = auth;
+        ap.pmf = pmf;
     }
     ctx->mutex.unlock();
 }
@@ -495,8 +556,9 @@ void onPromiscuousPacket(void* buf, wifi_promiscuous_pkt_type_t type) {
             std::string ssid;
             bool ssidSeen = false;
             WifiAuthenticationType auth = WIFI_AUTHENTICATION_TYPE_OPEN;
-            parseBeaconIes(payload + 24 + 12, len - 24 - 12, capability, ssid, ssidSeen, auth);
-            upsertApFromCapture(ctx, addr3, ssid, ssidSeen, channel, rssi, auth);
+            PmfState pmf = PmfState::None;
+            parseBeaconIes(payload + 24 + 12, len - 24 - 12, capability, ssid, ssidSeen, auth, pmf);
+            upsertApFromCapture(ctx, addr3, ssid, ssidSeen, channel, rssi, auth, pmf);
             storeBeaconForHandshake(ctx, addr3, payload, len, ssid);
         } else if (frameSubtype == 4) {
             std::string ssid = parseProbeRequestSsid(payload + 24, len - 24);
@@ -1139,6 +1201,13 @@ void mergeActiveScan(Context* ctx, const std::vector<WifiApRecord>& records) {
             ap.lastSeenMs = now;
             ap.rssiMin = ap.rssiMax = record.rssi;
             ap.colorIndex = ctx->nextColor++ % MAX_SERIES;
+            if (record.authentication_type == WIFI_AUTHENTICATION_TYPE_WPA3_PSK) {
+                ap.pmf = PmfState::Required;
+            } else if (record.authentication_type == WIFI_AUTHENTICATION_TYPE_WPA2_WPA3_PSK) {
+                ap.pmf = PmfState::Capable;
+            } else {
+                ap.pmf = PmfState::None;
+            }
             ctx->seen.emplace(key, ap);
         } else {
             SeenAp& ap = it->second;
@@ -1148,6 +1217,13 @@ void mergeActiveScan(Context* ctx, const std::vector<WifiApRecord>& records) {
             ap.lastSeenMs = now;
             ap.rssiMin = std::min(ap.rssiMin, record.rssi);
             ap.rssiMax = std::max(ap.rssiMax, record.rssi);
+            if (ap.pmf == PmfState::None) {
+                if (record.authentication_type == WIFI_AUTHENTICATION_TYPE_WPA3_PSK) {
+                    ap.pmf = PmfState::Required;
+                } else if (record.authentication_type == WIFI_AUTHENTICATION_TYPE_WPA2_WPA3_PSK) {
+                    ap.pmf = PmfState::Capable;
+                }
+            }
         }
     }
 }
@@ -1881,6 +1957,18 @@ void updateDetail(Context* ctx) {
     }
     lv_label_set_text(ctx->detailSecLabel, buf);
 
+    if (ctx->detailPmfLabel != nullptr) {
+        uint32_t pmfColor = 0xEF4444;
+        if (ap.pmf == PmfState::Required) {
+            pmfColor = 0x22C55E;
+        } else if (ap.pmf == PmfState::Capable) {
+            pmfColor = 0xEAB308;
+        }
+        snprintf(buf, sizeof(buf), "PMF (802.11w): %s", pmfToString(ap.pmf));
+        lv_label_set_text(ctx->detailPmfLabel, buf);
+        lv_obj_set_style_text_color(ctx->detailPmfLabel, lv_color_hex(pmfColor), 0);
+    }
+
     snprintf(buf, sizeof(buf), "Canale: %d (%d MHz)", (int)ap.record.channel, frequencyMhz((int)ap.record.channel));
     lv_label_set_text(ctx->detailChanLabel, buf);
 
@@ -2505,6 +2593,7 @@ void createDetailPage(Context* ctx, lv_obj_t* parent) {
 
     auto* secCard = createSectionCard(scroll, "Sicurezza e Canale");
     ctx->detailSecLabel = lv_label_create(secCard);
+    ctx->detailPmfLabel = lv_label_create(secCard);
     ctx->detailChanLabel = lv_label_create(secCard);
 
     auto* sigCard = createSectionCard(scroll, "Segnale e Distanza");
@@ -2515,7 +2604,7 @@ void createDetailPage(Context* ctx, lv_obj_t* parent) {
     ctx->detailTimeLabel = lv_label_create(techCard);
     ctx->detailDeauthLabel = lv_label_create(techCard);
 
-    for (auto* lbl : {ctx->detailSsidLabel, ctx->detailMacLabel, ctx->detailSecLabel, ctx->detailChanLabel, ctx->detailPowerLabel, ctx->detailPhyLabel, ctx->detailTimeLabel, ctx->detailDeauthLabel}) {
+    for (auto* lbl : {ctx->detailSsidLabel, ctx->detailMacLabel, ctx->detailSecLabel, ctx->detailPmfLabel, ctx->detailChanLabel, ctx->detailPowerLabel, ctx->detailPhyLabel, ctx->detailTimeLabel, ctx->detailDeauthLabel}) {
         if (lbl) {
             lv_obj_set_width(lbl, LV_PCT(100));
             lv_label_set_long_mode(lbl, LV_LABEL_LONG_MODE_WRAP);
@@ -3003,6 +3092,7 @@ void destroyWidgets(void* userData) {
     ctx->detailSsidLabel = nullptr;
     ctx->detailMacLabel = nullptr;
     ctx->detailSecLabel = nullptr;
+    ctx->detailPmfLabel = nullptr;
     ctx->detailChanLabel = nullptr;
     ctx->detailPowerLabel = nullptr;
     ctx->detailPhyLabel = nullptr;
