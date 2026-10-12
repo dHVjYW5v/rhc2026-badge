@@ -171,7 +171,7 @@ bool setupUsbBootMode() {
 void waitForMinimalSplashDuration(TickType_t startTime) {
     const auto end_time = get_ticks();
     const auto ticks_passed = end_time - startTime;
-    constexpr auto minimum_ticks = (2500 / portTICK_PERIOD_MS);
+    constexpr auto minimum_ticks = (4000 / portTICK_PERIOD_MS);
     if (minimum_ticks > ticks_passed) {
         delay_ticks(minimum_ticks - ticks_passed);
     }
