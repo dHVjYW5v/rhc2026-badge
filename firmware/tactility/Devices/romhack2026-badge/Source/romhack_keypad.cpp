@@ -192,8 +192,10 @@ static error_t keypad_read_key(Device* device, KeyboardKeyData* data) {
     // Check media keys state directly from physical buttons
     static uint32_t play_press_start_time = 0;
     static bool play_long_pressed = false;
-    static bool prev_was_pressed = false;
-    static bool next_was_pressed = false;
+    static uint32_t prev_press_start_time = 0;
+    static bool prev_long_pressed = false;
+    static uint32_t next_press_start_time = 0;
+    static bool next_long_pressed = false;
 
     bool play_is_pressed = ((new_physical & P0_PLAY) != 0);
     bool prev_is_pressed = (((new_physical >> 8) & P1_PREV) != 0);
@@ -221,19 +223,47 @@ static error_t keypad_read_key(Device* device, KeyboardKeyData* data) {
             }
         }
 
-        // Handle Prev button (<<)
-        if (prev_is_pressed && !prev_was_pressed) {
-            lv_display_trigger_activity(nullptr);
-            g_romhack_media_key_cb(0x20001, false); // Prev
+        // Handle Prev button (<<): short press = step ch--, long press = hop all
+        if (prev_is_pressed) {
+            if (prev_press_start_time == 0) {
+                prev_press_start_time = current_time;
+                prev_long_pressed = false;
+            } else if (!prev_long_pressed && (current_time - prev_press_start_time >= 600)) {
+                prev_long_pressed = true;
+                lv_display_trigger_activity(nullptr);
+                g_romhack_media_key_cb(0x20001, true); // Prev long press (Hop all)
+            }
+        } else {
+            if (prev_press_start_time != 0) {
+                if (!prev_long_pressed) {
+                    lv_display_trigger_activity(nullptr);
+                    g_romhack_media_key_cb(0x20001, false); // Prev short press (Step ch--)
+                }
+                prev_press_start_time = 0;
+                prev_long_pressed = false;
+            }
         }
-        prev_was_pressed = prev_is_pressed;
 
-        // Handle Next button (>>)
-        if (next_is_pressed && !next_was_pressed) {
-            lv_display_trigger_activity(nullptr);
-            g_romhack_media_key_cb(0x20002, false); // Next
+        // Handle Next button (>>): short press = step ch++, long press = hop all
+        if (next_is_pressed) {
+            if (next_press_start_time == 0) {
+                next_press_start_time = current_time;
+                next_long_pressed = false;
+            } else if (!next_long_pressed && (current_time - next_press_start_time >= 600)) {
+                next_long_pressed = true;
+                lv_display_trigger_activity(nullptr);
+                g_romhack_media_key_cb(0x20002, true); // Next long press (Hop all)
+            }
+        } else {
+            if (next_press_start_time != 0) {
+                if (!next_long_pressed) {
+                    lv_display_trigger_activity(nullptr);
+                    g_romhack_media_key_cb(0x20002, false); // Next short press (Step ch++)
+                }
+                next_press_start_time = 0;
+                next_long_pressed = false;
+            }
         }
-        next_was_pressed = next_is_pressed;
     }
 
     // DIAGNOSTIC: logged only on a physical change. p0 bit0=B bit1=PLAY bit2=RIGHT bit3=DOWN
