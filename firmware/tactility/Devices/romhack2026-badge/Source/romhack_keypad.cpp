@@ -94,6 +94,13 @@ static error_t stop(Device* device) {
     return ERROR_NONE;
 }
 
+typedef void (*romhack_media_key_cb_t)(uint32_t key, bool is_long_press);
+romhack_media_key_cb_t g_romhack_media_key_cb = nullptr;
+
+extern "C" void romhack_keypad_set_media_cb(romhack_media_key_cb_t cb) {
+    g_romhack_media_key_cb = cb;
+}
+
 static uint32_t scan_key(RomhackKeypadInternal* internal, uint32_t* out_physical) {
     uint8_t p0 = 0xFF;
     uint8_t p1 = 0xFF;
@@ -166,9 +173,11 @@ static uint32_t scan_key(RomhackKeypadInternal* internal, uint32_t* out_physical
         return LV_KEY_ESC;
     }
     
-    if (pressed0 & P0_PLAY) return 0x20000; // Custom code for Media Play/Pause
-    if (pressed1 & P1_PREV) return 0x20001; // Custom code for Media Prev
-    if (gpio0_pressed) return 0x20002;      // Custom code for Media Next
+    if (g_romhack_media_key_cb == nullptr) {
+        if (pressed0 & P0_PLAY) return 0x20000; // Custom code for Media Play/Pause
+        if (pressed1 & P1_PREV) return 0x20001; // Custom code for Media Prev
+        if (gpio0_pressed) return 0x20002;      // Custom code for Media Next
+    }
 
     return 0;
 }
@@ -179,6 +188,53 @@ static error_t keypad_read_key(Device* device, KeyboardKeyData* data) {
     uint32_t new_physical = 0;
     uint32_t new_key = scan_key(internal, &new_physical);
     uint32_t current_time = lv_tick_get();
+
+    // Check media keys state directly from physical buttons
+    static uint32_t play_press_start_time = 0;
+    static bool play_long_pressed = false;
+    static bool prev_was_pressed = false;
+    static bool next_was_pressed = false;
+
+    bool play_is_pressed = ((new_physical & P0_PLAY) != 0);
+    bool prev_is_pressed = (((new_physical >> 8) & P1_PREV) != 0);
+    bool next_is_pressed = (((new_physical >> 16) & 1) != 0);
+
+    if (g_romhack_media_key_cb != nullptr) {
+        // Handle Play button (short vs long press for tactical mode)
+        if (play_is_pressed) {
+            if (play_press_start_time == 0) {
+                play_press_start_time = current_time;
+                play_long_pressed = false;
+            } else if (!play_long_pressed && (current_time - play_press_start_time >= 700)) {
+                play_long_pressed = true;
+                lv_display_trigger_activity(nullptr);
+                g_romhack_media_key_cb(0x20003, true); // Tactical mode toggle
+            }
+        } else {
+            if (play_press_start_time != 0) {
+                if (!play_long_pressed) {
+                    lv_display_trigger_activity(nullptr);
+                    g_romhack_media_key_cb(0x20000, false); // Play short press
+                }
+                play_press_start_time = 0;
+                play_long_pressed = false;
+            }
+        }
+
+        // Handle Prev button (<<)
+        if (prev_is_pressed && !prev_was_pressed) {
+            lv_display_trigger_activity(nullptr);
+            g_romhack_media_key_cb(0x20001, false); // Prev
+        }
+        prev_was_pressed = prev_is_pressed;
+
+        // Handle Next button (>>)
+        if (next_is_pressed && !next_was_pressed) {
+            lv_display_trigger_activity(nullptr);
+            g_romhack_media_key_cb(0x20002, false); // Next
+        }
+        next_was_pressed = next_is_pressed;
+    }
 
     // DIAGNOSTIC: logged only on a physical change. p0 bit0=B bit1=PLAY bit2=RIGHT bit3=DOWN
     // bit5=LEFT bit6=UP, p1 bit0=PREV bit1=A1.

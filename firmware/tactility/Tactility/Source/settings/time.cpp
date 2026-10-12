@@ -75,7 +75,7 @@ std::string getTimeZoneName() {
             }
         }
     }
-    return "Europe/Amsterdam";
+    return "Europe/Rome";
 }
 
 bool hasTimeZone() {

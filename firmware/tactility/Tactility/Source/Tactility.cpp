@@ -220,6 +220,7 @@ namespace app {
     namespace lighting { extern const ::AppManifest manifest; }
     namespace rfid { extern const ::AppManifest manifest; }
     namespace wifiscanner { extern const ::AppManifest manifest; }
+    namespace hacking { extern const ::AppManifest manifest; }
     namespace musicplayer { extern const ::AppManifest manifest; }
     namespace retrogo { extern const ::AppManifest manifest; }
 }
@@ -313,6 +314,7 @@ static void registerInternalApps() {
     app_manager_add(&app::lighting::manifest);
     app_manager_add(&app::rfid::manifest);
     app_manager_add(&app::wifiscanner::manifest);
+    app_manager_add(&app::hacking::manifest);
     app_manager_add(&app::musicplayer::manifest);
     app_manager_add(&app::retrogo::manifest);
 }

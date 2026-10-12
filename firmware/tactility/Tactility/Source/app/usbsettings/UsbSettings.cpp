@@ -22,12 +22,50 @@ namespace {
 
 struct Context {
     uint32_t appInstanceId;
+    lv_obj_t* statusLabel = nullptr;
+    lv_obj_t* btnLiveToggle = nullptr;
+    lv_obj_t* labelLiveToggle = nullptr;
+    lv_obj_t* btnSdReboot = nullptr;
+    lv_obj_t* btnFlashReboot = nullptr;
 };
 
+static void updateUsbUI(Context* ctx) {
+    if (ctx == nullptr || ctx->statusLabel == nullptr || ctx->btnLiveToggle == nullptr) return;
+    bool isLive = (hal::usb::getMode() == hal::usb::Mode::MassStorageSdmmc || hal::usb::getMode() == hal::usb::Mode::MassStorageFlash);
+    if (isLive) {
+        lv_label_set_text(ctx->statusLabel, "USB Storage ACTIVE\nSD card shared with PC");
+        lv_obj_set_style_text_color(ctx->statusLabel, lv_palette_main(LV_PALETTE_GREEN), 0);
+        lv_label_set_text(ctx->labelLiveToggle, "Exit USB Mass Storage");
+        lv_obj_set_style_bg_color(ctx->btnLiveToggle, lv_palette_main(LV_PALETTE_RED), 0);
+        if (ctx->btnSdReboot) lv_obj_add_flag(ctx->btnSdReboot, LV_OBJ_FLAG_HIDDEN);
+        if (ctx->btnFlashReboot) lv_obj_add_flag(ctx->btnFlashReboot, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_label_set_text(ctx->statusLabel, "Connect badge to PC via USB");
+        lv_obj_set_style_text_color(ctx->statusLabel, lv_palette_main(LV_PALETTE_GREY), 0);
+        lv_label_set_text(ctx->labelLiveToggle, "Start USB Storage (Live SD)");
+        lv_obj_remove_local_style_prop(ctx->btnLiveToggle, LV_STYLE_BG_COLOR, 0);
+        if (ctx->btnSdReboot) lv_obj_remove_flag(ctx->btnSdReboot, LV_OBJ_FLAG_HIDDEN);
+        if (ctx->btnFlashReboot) lv_obj_remove_flag(ctx->btnFlashReboot, LV_OBJ_FLAG_HIDDEN);
+    }
+}
 
 void onBackPressed(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    if (hal::usb::getMode() == hal::usb::Mode::MassStorageSdmmc || hal::usb::getMode() == hal::usb::Mode::MassStorageFlash) {
+        hal::usb::stop();
+    }
     app_event_emit_close(ctx->appInstanceId);
+}
+
+static void onLiveToggleClicked(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    bool isLive = (hal::usb::getMode() == hal::usb::Mode::MassStorageSdmmc || hal::usb::getMode() == hal::usb::Mode::MassStorageFlash);
+    if (isLive) {
+        hal::usb::stop();
+    } else {
+        hal::usb::startMassStorageWithSdmmc(false);
+    }
+    updateUsbUI(ctx);
 }
 
 void onRebootMassStorageSdmmc(lv_event_t* event) {
@@ -42,8 +80,7 @@ void onRebootMassStorageFlash(lv_event_t* event) {
 void createWidgets(lv_obj_t* parent, void* userData) {
     auto* ctx = static_cast<Context*>(userData);
 
-    auto* toolbar = lvgl_toolbar_create(parent, "USB");
-    // The global toolbar nav callback only knows how to stop old-model apps.
+    auto* toolbar = lvgl_toolbar_create(parent, "USB Storage");
     lvgl_toolbar_set_nav_action(toolbar, LV_SYMBOL_CLOSE, onBackPressed, ctx);
     lv_obj_align(toolbar, LV_ALIGN_TOP_MID, 0, 0);
 
@@ -51,31 +88,46 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     auto* wrapper = lv_obj_create(parent);
     lv_obj_set_flex_flow(wrapper, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(wrapper, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(wrapper, 10, 0);
     lv_obj_set_size(wrapper, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_align(wrapper, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(wrapper, LV_ALIGN_CENTER, 0, 10);
+
+    ctx->statusLabel = lv_label_create(wrapper);
+    lv_obj_set_style_text_align(ctx->statusLabel, LV_TEXT_ALIGN_CENTER, 0);
 
     bool hasSd = hal::usb::canRebootIntoMassStorageSdmmc();
     bool hasFlash = hal::usb::canRebootIntoMassStorageFlash();
 
+    if (hasSd || hal::usb::isSupported()) {
+        ctx->btnLiveToggle = lv_button_create(wrapper);
+        ctx->labelLiveToggle = lv_label_create(ctx->btnLiveToggle);
+        lv_obj_add_event_cb(ctx->btnLiveToggle, onLiveToggleClicked, LV_EVENT_SHORT_CLICKED, ctx);
+    }
+
     if (hasSd) {
-        auto* button_sd = lv_button_create(wrapper);
-        auto* label_sd = lv_label_create(button_sd);
+        ctx->btnSdReboot = lv_button_create(wrapper);
+        auto* label_sd = lv_label_create(ctx->btnSdReboot);
         lv_label_set_text(label_sd, "Reboot as USB storage (SD)");
-        lv_obj_add_event_cb(button_sd, onRebootMassStorageSdmmc, LV_EVENT_SHORT_CLICKED, nullptr);
+        lv_obj_add_event_cb(ctx->btnSdReboot, onRebootMassStorageSdmmc, LV_EVENT_SHORT_CLICKED, nullptr);
     }
 
     if (hasFlash) {
-        auto* button_flash = lv_button_create(wrapper);
-        auto* label_flash = lv_label_create(button_flash);
+        ctx->btnFlashReboot = lv_button_create(wrapper);
+        auto* label_flash = lv_label_create(ctx->btnFlashReboot);
         lv_label_set_text(label_flash, "Reboot as USB storage (Flash)");
-        lv_obj_add_event_cb(button_flash, onRebootMassStorageFlash, LV_EVENT_SHORT_CLICKED, nullptr);
+        lv_obj_add_event_cb(ctx->btnFlashReboot, onRebootMassStorageFlash, LV_EVENT_SHORT_CLICKED, nullptr);
     }
 
-    if (!hasSd && !hasFlash) {
+    if (!hasSd && !hasFlash && !ctx->btnLiveToggle) {
         bool supported = hal::usb::isSupported();
         const char* message = supported ? "USB storage not available" : "USB driver not supported";
         auto* label = lv_label_create(wrapper);
         lv_label_set_text(label, message);
+    }
+
+    updateUsbUI(ctx);
+    if (ctx->btnLiveToggle) {
+        lv_group_focus_obj(ctx->btnLiveToggle);
     }
 }
 

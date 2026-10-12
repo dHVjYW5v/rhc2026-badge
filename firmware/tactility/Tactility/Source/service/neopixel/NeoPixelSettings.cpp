@@ -33,7 +33,7 @@ struct Settings {
     // White, so a pattern that paints the stage colour reads as neutral until one is picked.
     uint8_t activeR = 255, activeG = 255, activeB = 255;
     ColorMode activeColorMode = ColorMode::Static;
-    uint8_t activeBrightness = 2;
+    uint8_t activeBrightness = 1;
     uint8_t activeSpeed = 5;
 
     Animation standbyAnimation = Animation::Rainbow;

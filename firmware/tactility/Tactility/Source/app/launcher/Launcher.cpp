@@ -10,6 +10,8 @@
 #include <lvgl/fonts.h>
 #include <lvgl/lvgl.h>
 
+#include "HackingIcons.h"
+
 #include <lvgl_window_manager/window_manager.h>
 
 #include <tactility/check.h>
@@ -38,7 +40,7 @@ uint32_t getButtonPadding(UiDensity density, uint32_t buttonSize) {
 }
 
 int32_t computeButtonMargin(int32_t available_span, int32_t total_button_size) {
-    const int32_t usable = std::max<int32_t>(0, available_span - (3 * total_button_size));
+    const int32_t usable = std::max<int32_t>(0, available_span - (5 * total_button_size));
     return std::min<int32_t>(usable / 16, total_button_size / 2);
 }
 
@@ -48,7 +50,7 @@ void onAppPressed(lv_event_t* e) {
     app_manager_start(appId, &instance_id);
 }
 
-lv_obj_t* createAppButton(lv_obj_t* parent, UiDensity uiDensity, const char* imageFile, const char* appId, int32_t itemMargin, bool isLandscape) {
+lv_obj_t* createAppButton(lv_obj_t* parent, UiDensity uiDensity, const void* imageSrc, const char* appId, int32_t itemMargin, bool isLandscape, bool isDescriptor = false) {
     const auto button_size = lvgl_get_launcher_icon_font_height();
     const auto button_padding = getButtonPadding(uiDensity, button_size);
     auto* apps_button = lv_button_create(parent);
@@ -63,16 +65,35 @@ lv_obj_t* createAppButton(lv_obj_t* parent, UiDensity uiDensity, const char* ima
     lv_obj_set_style_shadow_width(apps_button, 0, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(apps_button, 0, LV_STATE_DEFAULT);
 
-    // create the image first
-    auto* button_image = lv_image_create(apps_button);
-    lv_obj_set_style_text_font(button_image, lvgl_get_launcher_icon_font(), LV_STATE_DEFAULT);
-    lv_image_set_src(button_image, imageFile);
-    lv_obj_set_style_text_color(button_image, lv_theme_get_color_primary(button_image), LV_STATE_DEFAULT);
-    lv_obj_set_style_image_recolor(button_image, lv_theme_get_color_primary(parent), LV_STATE_DEFAULT);
-    lv_obj_set_style_image_recolor_opa(button_image, LV_OPA_COVER, LV_STATE_DEFAULT);
+    // Focused style: distinct semitransparent background + solid outline border
+    lv_obj_set_style_bg_color(apps_button, lv_theme_get_color_primary(parent), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_opa(apps_button, LV_OPA_30, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(apps_button, 2, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(apps_button, lv_theme_get_color_primary(parent), LV_STATE_FOCUSED);
+    lv_obj_set_style_border_opa(apps_button, LV_OPA_COVER, LV_STATE_FOCUSED);
+    lv_obj_set_style_radius(apps_button, 8, LV_STATE_DEFAULT);
 
-    // Ensure it's square (Material Symbols are slightly wider than tall)
-    lv_obj_set_size(button_image, button_size, button_size);
+    lv_obj_set_style_bg_color(apps_button, lv_theme_get_color_primary(parent), LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_bg_opa(apps_button, LV_OPA_30, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_width(apps_button, 2, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_color(apps_button, lv_theme_get_color_primary(parent), LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_opa(apps_button, LV_OPA_COVER, LV_STATE_FOCUS_KEY);
+
+    // create the image
+    auto* button_image = lv_image_create(apps_button);
+    if (isDescriptor) {
+        lv_image_set_src(button_image, imageSrc);
+        lv_obj_set_size(button_image, button_size, button_size);
+        lv_obj_set_style_image_recolor(button_image, lv_theme_get_color_primary(parent), LV_STATE_DEFAULT);
+        lv_obj_set_style_image_recolor_opa(button_image, LV_OPA_COVER, LV_STATE_DEFAULT);
+    } else {
+        lv_obj_set_style_text_font(button_image, lvgl_get_launcher_icon_font(), LV_STATE_DEFAULT);
+        lv_image_set_src(button_image, static_cast<const char*>(imageSrc));
+        lv_obj_set_style_text_color(button_image, lv_theme_get_color_primary(button_image), LV_STATE_DEFAULT);
+        lv_obj_set_style_image_recolor(button_image, lv_theme_get_color_primary(parent), LV_STATE_DEFAULT);
+        lv_obj_set_style_image_recolor_opa(button_image, LV_OPA_COVER, LV_STATE_DEFAULT);
+        lv_obj_set_size(button_image, button_size, button_size);
+    }
 
     lv_obj_add_event_cb(apps_button, onAppPressed, LV_EVENT_SHORT_CLICKED, (void*)appId);
 
@@ -172,6 +193,8 @@ void createWidgets(lv_obj_t* parent, void*) {
     auto* app_list_button = createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_APPS, "tactility.applist", margin, is_landscape_display);
     createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_MUSIC_NOTE, "MusicPlayer", margin, is_landscape_display);
     createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_SETTINGS, "tactility.settings", margin, is_landscape_display);
+    createAppButton(buttons_wrapper, ui_density, &icon_8bit_skull, "tactility.hacking", margin, is_landscape_display, true);
+    createAppButton(buttons_wrapper, ui_density, &icon_usb_disk, "tactility.usbsettings", margin, is_landscape_display, true);
 
     // The launcher's container is several levels below the screen, and LVGL only sends
     // LV_EVENT_SIZE_CHANGED to the screen object itself on a resolution change - so the
@@ -188,6 +211,20 @@ void createWidgets(lv_obj_t* parent, void*) {
         lv_obj_add_event_cb(power_button, onAppPressed, LV_EVENT_SHORT_CLICKED, (void*)"tactility.poweroff");
         lv_obj_set_style_shadow_width(power_button, 0, LV_STATE_DEFAULT);
         lv_obj_set_style_bg_opa(power_button, 0, LV_PART_MAIN);
+
+        // Focus style for power button
+        lv_obj_set_style_bg_color(power_button, lv_theme_get_color_primary(parent), LV_STATE_FOCUSED);
+        lv_obj_set_style_bg_opa(power_button, LV_OPA_30, LV_STATE_FOCUSED);
+        lv_obj_set_style_border_width(power_button, 2, LV_STATE_FOCUSED);
+        lv_obj_set_style_border_color(power_button, lv_theme_get_color_primary(parent), LV_STATE_FOCUSED);
+        lv_obj_set_style_border_opa(power_button, LV_OPA_COVER, LV_STATE_FOCUSED);
+        lv_obj_set_style_radius(power_button, 8, LV_STATE_DEFAULT);
+
+        lv_obj_set_style_bg_color(power_button, lv_theme_get_color_primary(parent), LV_STATE_FOCUS_KEY);
+        lv_obj_set_style_bg_opa(power_button, LV_OPA_30, LV_STATE_FOCUS_KEY);
+        lv_obj_set_style_border_width(power_button, 2, LV_STATE_FOCUS_KEY);
+        lv_obj_set_style_border_color(power_button, lv_theme_get_color_primary(parent), LV_STATE_FOCUS_KEY);
+        lv_obj_set_style_border_opa(power_button, LV_OPA_COVER, LV_STATE_FOCUS_KEY);
 
         auto* power_label = lv_label_create(power_button);
         lv_label_set_text(power_label, LV_SYMBOL_POWER);

@@ -38,8 +38,8 @@ struct ApProperties {
     bool autoRemovePropertiesFile;
 };
 
-constexpr auto* DEFAULT_AP_SSID = "romhackcamp-badge";
-constexpr auto* DEFAULT_AP_PASSWORD = "ilovethisbadge";
+constexpr auto* DEFAULT_AP_SSID = "The Ping in the North";
+constexpr auto* DEFAULT_AP_PASSWORD = "A7CPND4YCT3C2J96";
 
 static void seedDefaultWifiAp() {
     if (settings::contains(DEFAULT_AP_SSID)) {
@@ -145,8 +145,8 @@ void bootSplashInit() {
 
         // The badge comes up on the venue network without anyone opening settings, but only on
         // the first boot. Written before shouldEnableOnBoot() below, which caches what it finds.
-        if (!settings::hasSettingsFile()) {
-            LOG_I(TAG, "No WiFi settings yet, enabling WiFi on boot");
+        if (!settings::hasSettingsFile() || !settings::shouldEnableOnBoot()) {
+            LOG_I(TAG, "Enabling WiFi on boot");
             settings::setEnableOnBoot(true);
         }
         // Import any provisioning files placed on the system data partition.

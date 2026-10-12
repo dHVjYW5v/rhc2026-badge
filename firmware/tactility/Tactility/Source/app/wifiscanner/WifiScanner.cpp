@@ -15,6 +15,10 @@
 
 #include <tactility/check.h>
 #include <tactility/log.h>
+#include <tactility/drivers/backlight.h>
+#include <tactility/drivers/display.h>
+
+extern "C" void romhack_keypad_set_media_cb(void (*cb)(uint32_t, bool));
 
 #include "OuiTable.h"
 
@@ -1178,7 +1182,72 @@ void restoreLedConfig(Context* ctx) {
     np::setActiveAnimation(ctx->savedAnim);
 }
 
+static bool g_tactical_mode = false;
+static uint8_t g_saved_backlight_duty = 200;
+static Context* g_active_scanner_ctx = nullptr;
+
+static Device* getDisplayBacklight() {
+    Device* display = nullptr;
+    if (device_get_first_by_type(&DISPLAY_TYPE, &display) != ERROR_NONE || display == nullptr) {
+        return nullptr;
+    }
+    if (device_get_driver(display)->api == nullptr) {
+        device_put(display);
+        return nullptr;
+    }
+    Device* backlight = nullptr;
+    display_get_backlight(display, &backlight);
+    device_put(display);
+    return backlight;
+}
+
+void updateLeds(Context* ctx);
+
+void setTacticalMode(Context* ctx, bool enabled) {
+    g_tactical_mode = enabled;
+    auto* bl = getDisplayBacklight();
+    if (bl != nullptr) {
+        if (g_tactical_mode) {
+            uint8_t current = 200;
+            if (backlight_get_brightness(bl, &current) == ERROR_NONE && current > 15) {
+                g_saved_backlight_duty = current;
+            }
+            backlight_set_brightness(bl, 15);
+        } else {
+            backlight_set_brightness(bl, g_saved_backlight_duty);
+        }
+    }
+
+    namespace np = service::neopixel;
+    if (g_tactical_mode) {
+        ctx->vuFeeding.store(false);
+        np::setVuActive(false);
+        np::setActiveAnimation(np::Animation::Off);
+        ctx->ledViewApplied = -1;
+    } else {
+        ctx->ledViewApplied = -1;
+        updateLeds(ctx);
+    }
+
+    lvgl_lock();
+    if (ctx->statusLabel != nullptr) {
+        if (g_tactical_mode) {
+            lv_label_set_text(ctx->statusLabel, "TACTICAL MODE (LEDs OFF / Dim)");
+        } else {
+            lv_label_set_text(ctx->statusLabel, "Tactical Mode OFF");
+        }
+    }
+    lvgl_unlock();
+}
+
 void updateLeds(Context* ctx) {
+    if (g_tactical_mode) {
+        namespace np = service::neopixel;
+        ctx->vuFeeding.store(false);
+        np::setVuActive(false);
+        np::setActiveAnimation(np::Animation::Off);
+        return;
+    }
     namespace np = service::neopixel;
     Page page;
     RadioMode mode;
@@ -1407,6 +1476,24 @@ void setMode(Context* ctx, RadioMode mode) {
         }
         if (ctx->statusLabel != nullptr) lv_label_set_text(ctx->statusLabel, "Capture stopped");
         lvgl_unlock();
+    } else if (mode == RadioMode::ActiveScan) {
+        lvgl_lock();
+        if (ctx->modeBadgeLabel != nullptr) {
+            lv_label_set_text(ctx->modeBadgeLabel, "SCAN");
+            lv_obj_set_style_bg_color(ctx->modeBadge, lv_color_hex(0x16A34A), 0);
+            lv_obj_set_style_text_color(ctx->modeBadgeLabel, lv_color_white(), 0);
+        }
+        if (ctx->statusLabel != nullptr) lv_label_set_text(ctx->statusLabel, "Active scan running");
+        lvgl_unlock();
+    } else if (mode == RadioMode::Capture) {
+        lvgl_lock();
+        if (ctx->modeBadgeLabel != nullptr) {
+            lv_label_set_text(ctx->modeBadgeLabel, "HOP");
+            lv_obj_set_style_bg_color(ctx->modeBadge, lv_color_hex(0xDC2626), 0);
+            lv_obj_set_style_text_color(ctx->modeBadgeLabel, lv_color_white(), 0);
+        }
+        if (ctx->statusLabel != nullptr) lv_label_set_text(ctx->statusLabel, "Capture / Sniff running");
+        lvgl_unlock();
     }
 
     updateLeds(ctx);
@@ -1425,6 +1512,78 @@ void onStop(lv_event_t* event) {
 }
 
 void updateDetail(Context* ctx);
+
+static void onMediaKey(uint32_t key, bool is_long_press) {
+    if (g_active_scanner_ctx == nullptr) return;
+    auto* ctx = g_active_scanner_ctx;
+
+    if (key == 0x20003 || is_long_press) {
+        // Toggle Tactical Mode
+        setTacticalMode(ctx, !g_tactical_mode);
+        return;
+    }
+
+    if (key == 0x20000) {
+        // Short-press Play: cycle ActiveScan -> Capture -> Stopped -> ActiveScan
+        RadioMode cur = RadioMode::Stopped;
+        if (ctx->mutex.lock(100 / portTICK_PERIOD_MS)) {
+            cur = ctx->mode;
+            ctx->mutex.unlock();
+        }
+        RadioMode next;
+        if (cur == RadioMode::ActiveScan) next = RadioMode::Capture;
+        else if (cur == RadioMode::Capture) next = RadioMode::Stopped;
+        else next = RadioMode::ActiveScan;
+        setMode(ctx, next);
+        return;
+    }
+
+    if (key == 0x20001) {
+        // Prev (<<): step lock channel --
+        int ch = getCaptureLockChannel();
+        if (ch <= 0) {
+            ch = 13;
+        } else {
+            ch--;
+            if (ch < 1) ch = 13;
+        }
+        if (ctx->mode != RadioMode::Capture) setMode(ctx, RadioMode::Capture);
+        setCaptureLockChannel(ch);
+        updateLeds(ctx);
+        if (ctx->page == Page::Detail) updateDetail(ctx);
+        lvgl_lock();
+        if (ctx->statusLabel != nullptr) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "Channel Lock: CH %d", ch);
+            lv_label_set_text(ctx->statusLabel, buf);
+        }
+        lvgl_unlock();
+        return;
+    }
+
+    if (key == 0x20002) {
+        // Next (>>): step lock channel ++
+        int ch = getCaptureLockChannel();
+        if (ch <= 0) {
+            ch = 1;
+        } else {
+            ch++;
+            if (ch > 13) ch = 1;
+        }
+        if (ctx->mode != RadioMode::Capture) setMode(ctx, RadioMode::Capture);
+        setCaptureLockChannel(ch);
+        updateLeds(ctx);
+        if (ctx->page == Page::Detail) updateDetail(ctx);
+        lvgl_lock();
+        if (ctx->statusLabel != nullptr) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "Channel Lock: CH %d", ch);
+            lv_label_set_text(ctx->statusLabel, buf);
+        }
+        lvgl_unlock();
+        return;
+    }
+}
 
 void onToggleLock(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
@@ -2499,7 +2658,7 @@ void showPage(Context* ctx, Page page) {
     switch (page) {
         case Page::Graph:
             lv_obj_remove_flag(ctx->graphPage, LV_OBJ_FLAG_HIDDEN);
-            if (ctx->toolbar != nullptr) lvgl_toolbar_set_title(ctx->toolbar, "Wi-Fi Scanner");
+            if (ctx->toolbar != nullptr) lvgl_toolbar_set_title(ctx->toolbar, "NetWhisperer");
             break;
         case Page::List:
             lv_obj_remove_flag(ctx->listPage, LV_OBJ_FLAG_HIDDEN);
@@ -2705,7 +2864,7 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(parent, 0, LV_STATE_DEFAULT);
 
-    ctx->toolbar = lvgl_toolbar_create(parent, "Wi-Fi Scanner");
+    ctx->toolbar = lvgl_toolbar_create(parent, "NetWhisperer");
     lvgl_toolbar_set_nav_action(ctx->toolbar, LV_SYMBOL_CLOSE, [](lv_event_t* e) {
         auto* ctx = static_cast<Context*>(lv_event_get_user_data(e));
         Page current;
@@ -2800,6 +2959,9 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
     service::wifi::setAutoScanPaused(true);
 
     saveLedConfig(&ctx);
+
+    g_active_scanner_ctx = &ctx;
+    romhack_keypad_set_media_cb(onMediaKey);
 
     ctx.timer = std::make_unique<Timer>(Timer::Type::Periodic, REFRESH_MS, [&ctx] {
         onTimer(&ctx);
@@ -2945,6 +3107,12 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
         }
     }
 
+    romhack_keypad_set_media_cb(nullptr);
+    if (g_tactical_mode) {
+        setTacticalMode(&ctx, false);
+    }
+    g_active_scanner_ctx = nullptr;
+
     stopTimer(&ctx);
     stopCapture(&ctx);
     stopEvilTwinAp();
@@ -2962,7 +3130,7 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
 
 extern const ::AppManifest manifest = {
     .id = "WifiScanner",
-    .name = "Wi-Fi Scanner",
+    .name = "NetWhisperer",
     .category = APP_CATEGORY_SYSTEM,
     .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) }
 };

@@ -193,7 +193,7 @@ static bool loadFromFile(DisplaySettings& settings) {
         timeout_enabled = (timeout_enabled_entry->second == "1" || timeout_enabled_entry->second == "true" || timeout_enabled_entry->second == "True");
     }
 
-    uint32_t timeout_ms = 15000; // default 15s
+    uint32_t timeout_ms = 300000; // default 5m
     auto timeout_ms_entry = map.find(SETTINGS_KEY_TIMEOUT_MS);
     if (timeout_ms_entry != map.end()) {
         timeout_ms = static_cast<uint32_t>(std::strtoul(timeout_ms_entry->second.c_str(), nullptr, 10));
@@ -213,7 +213,7 @@ static bool loadFromFile(DisplaySettings& settings) {
     settings.screensaverType = screensaver_type;
 
     auto theme_entry = map.find(SETTINGS_KEY_THEME);
-    ThemeType theme = ThemeType::RomHack;
+    ThemeType theme = ThemeType::TokyoNight;
     if (theme_entry != map.end()) {
         fromString(theme_entry->second, theme);
     }
@@ -252,9 +252,9 @@ DisplaySettings getDefault() {
         .gammaCurve = 1,
         .backlightDuty = 200,
         .backlightTimeoutEnabled = true,
-        .backlightTimeoutMs = 15000,
+        .backlightTimeoutMs = 300000,
         .screensaverType = ScreensaverType::CassetteTape,
-        .theme = ThemeType::RomHack
+        .theme = ThemeType::TokyoNight
     };
 }
 
