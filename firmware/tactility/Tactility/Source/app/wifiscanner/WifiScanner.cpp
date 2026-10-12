@@ -1345,10 +1345,12 @@ void refreshModeButtons(Context* ctx) {
     if (ctx->scanButton != nullptr) {
         if (mode == RadioMode::ActiveScan) {
             lv_obj_add_state(ctx->scanButton, LV_STATE_DISABLED);
-            lv_obj_set_style_bg_color(ctx->scanButton, lv_color_hex(0x0284C7), 0);
+            lv_obj_set_style_bg_color(ctx->scanButton, lv_color_hex(0x16A34A), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(ctx->scanButton, lv_color_hex(0x16A34A), LV_STATE_DISABLED);
         } else {
             lv_obj_remove_state(ctx->scanButton, LV_STATE_DISABLED);
-            lv_obj_set_style_bg_color(ctx->scanButton, lv_color_hex(0x202020), 0);
+            lv_obj_remove_local_style_prop(ctx->scanButton, LV_STYLE_BG_COLOR, LV_STATE_DEFAULT);
+            lv_obj_remove_local_style_prop(ctx->scanButton, LV_STYLE_BG_COLOR, LV_STATE_DISABLED);
         }
     }
     if (ctx->captureButton != nullptr) {
@@ -1356,14 +1358,16 @@ void refreshModeButtons(Context* ctx) {
             lv_obj_add_state(ctx->captureButton, LV_STATE_DISABLED);
             int lock = getCaptureLockChannel();
             bool isLocked = (lock >= 1 && lock <= 13);
-            lv_obj_set_style_bg_color(ctx->captureButton, lv_color_hex(isLocked ? 0xD97706 : 0x0D9488), 0);
+            lv_obj_set_style_bg_color(ctx->captureButton, lv_color_hex(0xDC2626), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(ctx->captureButton, lv_color_hex(0xDC2626), LV_STATE_DISABLED);
             lv_obj_t* lbl = lv_obj_get_child(ctx->captureButton, 0);
             if (lbl != nullptr) {
                 lv_label_set_text(lbl, isLocked ? LV_SYMBOL_SETTINGS : LV_SYMBOL_EYE_OPEN);
             }
         } else {
             lv_obj_remove_state(ctx->captureButton, LV_STATE_DISABLED);
-            lv_obj_set_style_bg_color(ctx->captureButton, lv_color_hex(0x202020), 0);
+            lv_obj_remove_local_style_prop(ctx->captureButton, LV_STYLE_BG_COLOR, LV_STATE_DEFAULT);
+            lv_obj_remove_local_style_prop(ctx->captureButton, LV_STYLE_BG_COLOR, LV_STATE_DISABLED);
             lv_obj_t* lbl = lv_obj_get_child(ctx->captureButton, 0);
             if (lbl != nullptr) {
                 lv_label_set_text(lbl, LV_SYMBOL_EYE_OPEN);
@@ -1373,11 +1377,11 @@ void refreshModeButtons(Context* ctx) {
     if (ctx->stopButton != nullptr) {
         if (mode == RadioMode::Stopped) {
             lv_obj_add_state(ctx->stopButton, LV_STATE_DISABLED);
-            lv_obj_set_style_bg_color(ctx->stopButton, lv_color_hex(0x202020), 0);
         } else {
             lv_obj_remove_state(ctx->stopButton, LV_STATE_DISABLED);
-            lv_obj_set_style_bg_color(ctx->stopButton, lv_color_hex(0xDC2626), 0);
         }
+        lv_obj_remove_local_style_prop(ctx->stopButton, LV_STYLE_BG_COLOR, LV_STATE_DEFAULT);
+        lv_obj_remove_local_style_prop(ctx->stopButton, LV_STYLE_BG_COLOR, LV_STATE_DISABLED);
     }
 }
 
@@ -1879,12 +1883,7 @@ void createAxisLabels(lv_obj_t* parent) {
         snprintf(text, sizeof(text), "%d", channel);
         auto* label = lv_label_create(row);
         lv_label_set_text(label, text);
-        bool isPrimary = (channel == 1 || channel == 6 || channel == 11);
-        if (isPrimary) {
-            lv_obj_set_style_text_color(label, lv_color_hex(0x38BDF8), 0);
-        } else {
-            lv_obj_set_style_text_color(label, lv_color_hex(0x757575), 0);
-        }
+        lv_obj_set_style_text_color(label, lv_color_hex(0x757575), 0);
         lv_obj_set_x(label, lv_pct((int)(100 * channelFraction(channel))));
         lv_obj_set_style_translate_x(label, channel < 10 ? -4 : -8, 0);
     }
@@ -1893,17 +1892,11 @@ void createAxisLabels(lv_obj_t* parent) {
 void createChannelGrid(lv_obj_t* chartWrapper) {
     for (int channel = 1; channel <= 13; channel++) {
         auto* line = lv_obj_create(chartWrapper);
-        bool isPrimary = (channel == 1 || channel == 6 || channel == 11);
-        lv_obj_set_size(line, isPrimary ? 2 : 1, LV_PCT(100));
+        lv_obj_set_size(line, 1, LV_PCT(100));
         lv_obj_set_style_border_width(line, 0, 0);
         lv_obj_set_style_radius(line, 0, 0);
-        if (isPrimary) {
-            lv_obj_set_style_bg_color(line, lv_color_hex(0x38BDF8), 0);
-            lv_obj_set_style_bg_opa(line, LV_OPA_70, 0);
-        } else {
-            lv_obj_set_style_bg_color(line, lv_color_hex(0x505050), 0);
-            lv_obj_set_style_bg_opa(line, LV_OPA_30, 0);
-        }
+        lv_obj_set_style_bg_color(line, lv_color_hex(0x505050), 0);
+        lv_obj_set_style_bg_opa(line, LV_OPA_30, 0);
         lv_obj_remove_flag(line, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_remove_flag(line, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_set_x(line, lv_pct((int)(100 * channelFraction(channel))));
@@ -2599,12 +2592,12 @@ void updateViews(Context* ctx) {
             int lock = g_lockChannel.load();
             if (lock >= 1 && lock <= 13) {
                 snprintf(badgeText, sizeof(badgeText), "LOCK %d", lock);
-                badgeBg = 0x7C2D12;
-                badgeFg = 0xFDBA74;
+                badgeBg = 0xB91C1C;
+                badgeFg = 0xFFFFFF;
             } else {
                 snprintf(badgeText, sizeof(badgeText), "HOP %d", g_hopChannel.load());
-                badgeBg = 0x0F766E;
-                badgeFg = 0x5EEAD4;
+                badgeBg = 0xDC2626;
+                badgeFg = 0xFFFFFF;
             }
             if (pmkid > 0) {
                 snprintf(statsText, sizeof(statsText), "%u AP | %u CLI | HS:%d P:%d",
@@ -2615,12 +2608,14 @@ void updateViews(Context* ctx) {
             }
 #else
             snprintf(badgeText, sizeof(badgeText), "SIM");
+            badgeBg = 0xDC2626;
+            badgeFg = 0xFFFFFF;
             snprintf(statsText, sizeof(statsText), "%u AP | %u CLI", (unsigned)aps.size(), (unsigned)clientCount);
 #endif
         } else if (mode == RadioMode::ActiveScan) {
             snprintf(badgeText, sizeof(badgeText), "SCAN");
-            badgeBg = 0x0369A1;
-            badgeFg = 0xE0F2FE;
+            badgeBg = 0x16A34A;
+            badgeFg = 0xFFFFFF;
             snprintf(statsText, sizeof(statsText), "%u AP rilevati%s", (unsigned)aps.size(),
                 service::wifi::isScanning() ? "..." : "");
         } else {
