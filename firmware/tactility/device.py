@@ -326,7 +326,6 @@ def write_lvgl_variables(output_file, device_properties: dict):
     font_height = safe_int(font_height_text, f"Font height must be an integer, but was: '{font_height_text}'")
     if font_height <= 12:
         output_file.write("CONFIG_LV_FONT_MONTSERRAT_8=y\n")
-        output_file.write("CONFIG_LV_FONT_MONTSERRAT_12=y\n")
         output_file.write("CONFIG_LV_FONT_MONTSERRAT_16=y\n")
         output_file.write("CONFIG_LV_FONT_DEFAULT_MONTSERRAT_12=y\n")
         output_file.write("CONFIG_TT_LVGL_FONT_SIZE_SMALL=8\n")
@@ -337,6 +336,8 @@ def write_lvgl_variables(output_file, device_properties: dict):
         output_file.write("CONFIG_TT_LVGL_SHARED_ICON_SIZE=12\n")
     elif font_height <= 14:
         output_file.write("CONFIG_LV_FONT_MONTSERRAT_10=y\n")
+        output_file.write("CONFIG_LV_FONT_MONTSERRAT_12=y\n")
+                                                        
         output_file.write("CONFIG_LV_FONT_MONTSERRAT_14=y\n")
         output_file.write("CONFIG_LV_FONT_MONTSERRAT_18=y\n")
         output_file.write("CONFIG_LV_FONT_DEFAULT_MONTSERRAT_14=y\n")
@@ -347,7 +348,6 @@ def write_lvgl_variables(output_file, device_properties: dict):
         output_file.write("CONFIG_TT_LVGL_LAUNCHER_ICON_SIZE=36\n")
         output_file.write("CONFIG_TT_LVGL_SHARED_ICON_SIZE=16\n")
     elif font_height <= 16:
-        output_file.write("CONFIG_LV_FONT_MONTSERRAT_12=y\n")
         output_file.write("CONFIG_LV_FONT_MONTSERRAT_16=y\n")
         output_file.write("CONFIG_LV_FONT_MONTSERRAT_22=y\n")
         output_file.write("CONFIG_LV_FONT_DEFAULT_MONTSERRAT_16=y\n")
