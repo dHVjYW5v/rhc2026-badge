@@ -230,7 +230,10 @@ struct Context {
     std::atomic<uint32_t> clientDeauthDialogId{0};
     std::atomic<uint32_t> pmkidDialogId{0};
     std::atomic<uint32_t> evilTwinDialogId{0};
+    std::atomic<uint32_t> reconKarmaDialogId{0};
     uint64_t targetClientKey = 0;
+    uint64_t reconTargetClientKey = 0;
+    std::string reconTargetSsid;
     std::vector<uint64_t> visible;
     uint64_t selectedKey = 0;
     uint32_t detailBeaconBaseline = 0;
@@ -510,7 +513,22 @@ std::string parseProbeRequestSsid(const uint8_t* ies, int iesLen) {
         uint8_t len = ies[i + 1];
         if (i + 2 + len > iesLen) break;
         if (tag == 0 && len > 0) {
-            return std::string(reinterpret_cast<const char*>(ies + i + 2), len);
+            if (len > 32) len = 32;
+            std::string s(reinterpret_cast<const char*>(ies + i + 2), len);
+            bool hasPrintable = false;
+            for (char& c : s) {
+                unsigned char uc = (unsigned char)c;
+                if (uc < 0x20 || uc >= 0x7F) {
+                    c = ' ';
+                } else {
+                    hasPrintable = true;
+                }
+            }
+            if (!hasPrintable) return {};
+            size_t start = s.find_first_not_of(" \t\r\n");
+            size_t end = s.find_last_not_of(" \t\r\n");
+            if (start == std::string::npos) return {};
+            return s.substr(start, end - start + 1);
         }
         i += 2 + len;
     }
@@ -1245,12 +1263,8 @@ void triggerWidsAlert(Context* ctx, WidsAttackType type, const char* desc, const
         ctx->widsThreatClearTick = lv_tick_get() + 3500;
 
         uint32_t now = lv_tick_get();
-        WidsAttackType curSevere = ctx->widsMostSevereThreat.load();
-        bool expired = (now - ctx->widsSevereThreatTimestampMs) >= (5 * 60 * 1000);
-        if (expired || curSevere == WidsAttackType::None || widsThreatSeverity(type) >= widsThreatSeverity(curSevere)) {
-            ctx->widsMostSevereThreat.store(type);
-            ctx->widsSevereThreatTimestampMs = now;
-        }
+        ctx->widsMostSevereThreat.store(type);
+        ctx->widsSevereThreatTimestampMs = now;
         ctx->mutex.unlock();
     }
 
@@ -3655,7 +3669,7 @@ void updateModuleHomePage(Context* ctx) {
         }
     }
 
-    // 2. Sentinel: 5-minute severe threat memory, ARMED, STANDBY
+    // 2. Sentinel: 5-minute recent threat memory, ARMED, STANDBY
     WidsAttackType severeThreat = getRecentSevereThreat(ctx);
     if (ctx->homeSentinelBadge != nullptr) {
         if (!ctx->widsActive) {
@@ -3674,7 +3688,11 @@ void updateModuleHomePage(Context* ctx) {
             lv_label_set_text(ctx->homeSentinelSubBadge, "DISATTIVO");
             lv_obj_set_style_text_color(ctx->homeSentinelSubBadge, lv_color_hex(0x64748B), 0);
         } else if (severeThreat != WidsAttackType::None) {
-            lv_label_set_text(ctx->homeSentinelSubBadge, widsAttackToString(severeThreat));
+            const char* threatShort = "ATTACCO";
+            if (severeThreat == WidsAttackType::DeauthFlood) threatShort = "DEAUTH";
+            else if (severeThreat == WidsAttackType::RogueApClone) threatShort = "ROGUE AP";
+            else if (severeThreat == WidsAttackType::BeaconSpam) threatShort = "BEACON";
+            lv_label_set_text(ctx->homeSentinelSubBadge, threatShort);
             lv_obj_set_style_text_color(ctx->homeSentinelSubBadge, lv_color_hex(0xF97316), 0);
         } else {
             lv_label_set_text(ctx->homeSentinelSubBadge, "0 ANOMALIE");
@@ -3846,6 +3864,8 @@ void createModuleHomePage(Context* ctx, lv_obj_t* parent) {
         // Label 1 (Font 12)
         auto* b1 = lv_label_create(slotBox);
         lv_label_set_text(b1, "--");
+        lv_obj_set_width(b1, LV_PCT(100));
+        lv_label_set_long_mode(b1, LV_LABEL_LONG_MODE_CLIP);
         lv_obj_set_style_text_font(b1, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(b1, accentColor, 0);
         lv_obj_set_style_text_align(b1, LV_TEXT_ALIGN_CENTER, 0);
@@ -3854,6 +3874,8 @@ void createModuleHomePage(Context* ctx, lv_obj_t* parent) {
         // Label 2 (Font 12)
         auto* b2 = lv_label_create(slotBox);
         lv_label_set_text(b2, "--");
+        lv_obj_set_width(b2, LV_PCT(100));
+        lv_label_set_long_mode(b2, LV_LABEL_LONG_MODE_CLIP);
         lv_obj_set_style_text_font(b2, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(b2, lv_color_hex(0x94A3B8), 0);
         lv_obj_set_style_text_align(b2, LV_TEXT_ALIGN_CENTER, 0);
@@ -3941,6 +3963,50 @@ constexpr int COL_RECON_MAC = 106;
 constexpr int COL_RECON_RSSI = 34;
 constexpr int COL_RECON_PKT = 30;
 
+struct ReconRowDataHolder {
+    Context* ctx;
+    uint64_t key;
+};
+
+void onReconRowClick(Context* ctx, uint64_t key) {
+    if (ctx == nullptr) return;
+    std::string targetSsid;
+    uint8_t mac[6] = {};
+    bool found = false;
+    if (ctx->mutex.lock(250 / portTICK_PERIOD_MS)) {
+        auto it = ctx->clients.find(key);
+        if (it != ctx->clients.end()) {
+            memcpy(mac, it->second.mac, 6);
+            if (!it->second.probedSsids.empty()) {
+                targetSsid = it->second.probedSsids.front();
+            }
+            found = true;
+        }
+        ctx->mutex.unlock();
+    }
+    if (!found) return;
+
+    if (targetSsid.empty()) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Client: %s\nNessun SSID specifico cercato (solo probe broadcast).", macToString(mac).c_str());
+        tt::app::alertdialog::start(ctx->appInstanceId, "Client Probe", msg, { "OK" });
+        return;
+    }
+
+    ctx->reconTargetClientKey = key;
+    ctx->reconTargetSsid = targetSsid;
+
+    char msg[160];
+    snprintf(msg, sizeof(msg), "Creare Evil Twin per questo client?\n\nSSID: %s\nClient: %s",
+        targetSsid.c_str(), macToString(mac).c_str());
+    ctx->reconKarmaDialogId = tt::app::alertdialog::start(
+        ctx->appInstanceId,
+        "Karma Evil Twin",
+        msg,
+        { "Crea Evil Twin", "Annulla" }
+    );
+}
+
 lv_obj_t* createReconRow(Context* ctx, uint64_t key) {
     auto* row = lv_list_add_button(ctx->reconList, nullptr, "");
     lv_obj_clean(row);
@@ -3950,7 +4016,20 @@ lv_obj_t* createReconRow(Context* ctx, uint64_t key) {
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_all(row, 2, 0);
     lv_obj_set_style_pad_column(row, 4, 0);
-    (void)key;
+
+    auto* holder = new ReconRowDataHolder{ctx, key};
+    lv_obj_set_user_data(row, holder);
+    lv_obj_add_event_cb(row, [](lv_event_t* e) {
+        auto code = lv_event_get_code(e);
+        auto* h = static_cast<ReconRowDataHolder*>(lv_event_get_user_data(e));
+        if (code == LV_EVENT_DELETE) {
+            delete h;
+            return;
+        }
+        if (code == LV_EVENT_CLICKED && h != nullptr) {
+            onReconRowClick(h->ctx, h->key);
+        }
+    }, LV_EVENT_ALL, holder);
 
     // Child 0: Accent chip
     auto* chip = lv_obj_create(row);
@@ -5046,6 +5125,67 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
                             stopEvilTwinAp();
                             setCaptureLockChannel(0);
                         }
+                    }
+                } else if (event.result.launch_id == ctx.reconKarmaDialogId.load() && event.result.result == 0) {
+                    std::string targetSsid;
+                    uint64_t targetCliKey = 0;
+                    if (ctx.mutex.lock(250 / portTICK_PERIOD_MS)) {
+                        targetSsid = ctx.reconTargetSsid;
+                        targetCliKey = ctx.reconTargetClientKey;
+                        ctx.mutex.unlock();
+                    }
+                    if (!targetSsid.empty()) {
+                        int channel = 1;
+                        uint8_t targetBssid[6] = {0x02, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E};
+                        uint64_t apKey = 0;
+
+                        if (ctx.mutex.lock(250 / portTICK_PERIOD_MS)) {
+                            // Find if matching AP already seen
+                            for (const auto& [k, ap] : ctx.seen) {
+                                if (targetSsid == ap.record.ssid && ap.record.channel >= 1 && ap.record.channel <= 13) {
+                                    channel = ap.record.channel;
+                                    memcpy(targetBssid, ap.record.bssid, 6);
+                                    apKey = k;
+                                    break;
+                                }
+                            }
+                            if (apKey == 0) {
+                                // Create AP entry in seen so Tactical details page can display it
+                                if (ctx.myMacValid) {
+                                    memcpy(targetBssid, ctx.myApMac, 6);
+                                }
+                                apKey = bssidKey(targetBssid);
+                                SeenAp newAp{};
+                                memcpy(newAp.record.bssid, targetBssid, 6);
+                                strncpy(newAp.record.ssid, targetSsid.c_str(), sizeof(newAp.record.ssid) - 1);
+                                newAp.record.channel = channel;
+                                newAp.record.rssi = -35;
+                                newAp.record.authentication_type = WIFI_AUTHENTICATION_TYPE_OPEN;
+                                newAp.firstSeenMs = nowMs();
+                                newAp.lastSeenMs = nowMs();
+                                newAp.fromCapture = true;
+                                ctx.seen[apKey] = newAp;
+                            }
+                            ctx.selectedKey = apKey;
+                            ctx.targetClientKey = targetCliKey;
+                            ctx.evilTwinActive = true;
+                            ctx.mutex.unlock();
+                        }
+
+                        if (ctx.mode != RadioMode::Capture) {
+                            lvgl_lock();
+                            setMode(&ctx, RadioMode::Capture);
+                            lvgl_unlock();
+                        }
+                        setCaptureLockChannel(channel);
+                        startEvilTwinAp(targetSsid.c_str(), channel);
+                        sendDeauthBurstOnChannel(targetBssid, channel, nullptr);
+                        recordLocalAttack(&ctx, WidsAttackType::RogueApClone, "Rogue AP Karma (Tactical)", targetBssid, channel, 1);
+
+                        // Take the user straight to Tactical AP Detail page!
+                        lvgl_lock();
+                        showPage(&ctx, Page::Detail);
+                        lvgl_unlock();
                     }
                 }
                 app_manager_stop(event.result.launch_id);
