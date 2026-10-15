@@ -42,6 +42,7 @@ extern "C" void romhack_keypad_set_media_cb(void (*cb)(uint32_t, bool));
 #include <esp_wifi.h>
 #include <esp_timer.h>
 #include <esp_netif.h>
+#include <esp_mac.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <sys/stat.h>
@@ -300,10 +301,22 @@ struct Context {
     std::atomic<uint32_t> widsLastDeauthRate{0};
     std::atomic<uint32_t> widsPeakDeauthRate{0};
     uint8_t widsLastAttackedBssid[6] = {};
+    int widsLastAttackedChannel = 0;
+    std::atomic<uint32_t> widsNewBssidWindowCount{0};
     std::atomic<WidsAttackType> widsActiveThreat{WidsAttackType::None};
     uint32_t widsThreatClearTick = 0;
     std::deque<WidsEvent> widsEvents;
     int widsTotalAttacks = 0;
+
+    // Self-attack filter state & local identity
+    bool widsFilterSelf = false;
+    uint8_t myStaMac[6] = {};
+    uint8_t myApMac[6] = {};
+    bool myMacValid = false;
+    uint32_t lastLocalAttackTimestampMs = 0;
+    uint8_t lastLocalAttackBssid[6] = {};
+    int lastLocalAttackChannel = 0;
+    WidsAttackType lastLocalAttackType = WidsAttackType::None;
 
     lv_obj_t* widsDetailPage = nullptr;
     lv_obj_t* widsDetailScroll = nullptr;
@@ -311,7 +324,7 @@ struct Context {
     lv_obj_t* widsMetricsLabel = nullptr;
     lv_obj_t* widsPcapButton = nullptr;
     lv_obj_t* widsChannelModeButton = nullptr;
-    lv_obj_t* widsClearButton = nullptr;
+    lv_obj_t* widsFilterSelfButton = nullptr;
     lv_obj_t* widsLogList = nullptr;
     size_t widsLogRenderedCount = (size_t)-1;
     uint32_t widsLogRenderedTime = 0;
@@ -374,6 +387,40 @@ inline WidsAttackType getRecentSevereThreat(Context* ctx) {
 }
 
 void triggerWidsAlert(Context* ctx, WidsAttackType type, const char* desc, const uint8_t* bssid = nullptr, int channel = 0, uint16_t rate = 0);
+
+inline bool isPacketFromMe(Context* ctx, const uint8_t* addr2, const uint8_t* addr3, int channel) {
+    if (ctx == nullptr) return false;
+    if (ctx->myMacValid) {
+        if (addr2 != nullptr && (memcmp(addr2, ctx->myStaMac, 6) == 0 || memcmp(addr2, ctx->myApMac, 6) == 0)) {
+            return true;
+        }
+    }
+    static const uint8_t FAKE_CLIENT[6] = {0x02, 0xDE, 0xAD, 0xBE, 0xEF, 0x01};
+    if (addr2 != nullptr && memcmp(addr2, FAKE_CLIENT, 6) == 0) {
+        return true;
+    }
+    if (ctx->lastLocalAttackTimestampMs != 0 && (lv_tick_get() - ctx->lastLocalAttackTimestampMs < 5000)) {
+        if (channel == ctx->lastLocalAttackChannel && addr3 != nullptr && memcmp(addr3, ctx->lastLocalAttackBssid, 6) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline void recordLocalAttack(Context* ctx, WidsAttackType type, const char* desc, const uint8_t* bssid, int channel, uint16_t rate) {
+    if (ctx == nullptr) return;
+    ctx->lastLocalAttackTimestampMs = lv_tick_get();
+    if (bssid != nullptr) memcpy(ctx->lastLocalAttackBssid, bssid, 6);
+    ctx->lastLocalAttackChannel = channel;
+    ctx->lastLocalAttackType = type;
+    if (!ctx->widsFilterSelf) {
+        triggerWidsAlert(ctx, type, desc, bssid, channel, rate);
+        if (type == WidsAttackType::DeauthFlood) {
+            ctx->widsLastDeauthRate.store(rate);
+            if (rate > ctx->widsPeakDeauthRate.load()) ctx->widsPeakDeauthRate.store(rate);
+        }
+    }
+}
 
 #ifdef ESP_PLATFORM
 
@@ -531,17 +578,21 @@ void upsertApFromCapture(Context* ctx, const uint8_t* bssid, const std::string& 
         ap.packetCount = 1;
         ap.pmf = pmf;
         ctx->seen.emplace(key, ap);
+        ctx->widsNewBssidWindowCount.fetch_add(1);
 
-        // Check for Rogue AP clone (same SSID, different BSSID, differing security)
+        // Check for Rogue AP clone (same SSID, different BSSID, differing security or channel)
         if (ssidSeen && !ssid.empty()) {
             for (const auto& [k, existingAp] : ctx->seen) {
                 if (k != key && existingAp.record.ssid[0] != '\0' &&
                     ssid == existingAp.record.ssid &&
-                    existingAp.record.authentication_type != auth) {
-                    char alertMsg[64];
-                    snprintf(alertMsg, sizeof(alertMsg), "Rogue AP clonato: %s", ssid.c_str());
-                    triggerWidsAlert(ctx, WidsAttackType::RogueApClone, alertMsg, bssid, channel, 1);
-                    break;
+                    (existingAp.record.authentication_type != auth || existingAp.record.channel != channel)) {
+                    bool fromMe = isPacketFromMe(ctx, bssid, bssid, channel);
+                    if (!ctx->widsFilterSelf || !fromMe) {
+                        char alertMsg[64];
+                        snprintf(alertMsg, sizeof(alertMsg), "Rogue AP clonato: %s", ssid.c_str());
+                        triggerWidsAlert(ctx, WidsAttackType::RogueApClone, alertMsg, bssid, channel, 1);
+                        break;
+                    }
                 }
             }
         }
@@ -704,8 +755,12 @@ void onPromiscuousPacket(void* buf, wifi_promiscuous_pkt_type_t type) {
 
     if (frameType == 0) {
         if (frameSubtype == 12 || frameSubtype == 10) { // Deauth (12) o Disassoc (10)
-            ctx->widsDeauthWindowCount.fetch_add(1);
-            memcpy(ctx->widsLastAttackedBssid, addr3, 6);
+            bool fromMe = isPacketFromMe(ctx, addr2, addr3, channel);
+            if (!ctx->widsFilterSelf || !fromMe) {
+                ctx->widsDeauthWindowCount.fetch_add(1);
+                memcpy(ctx->widsLastAttackedBssid, addr3, 6);
+                ctx->widsLastAttackedChannel = channel;
+            }
         } else if ((frameSubtype == 8 || frameSubtype == 5) && len >= 24 + 12) {
             uint16_t capability = payload[24 + 10] | (payload[24 + 11] << 8);
             std::string ssid;
@@ -1522,16 +1577,19 @@ void mergeActiveScan(Context* ctx, const std::vector<WifiApRecord>& records) {
             }
             ctx->seen.emplace(key, ap);
 
-            // WIDS detection: verifica presenza di Rogue AP clonato con sicurezza diversa
+            // WIDS detection: verifica presenza di Rogue AP clonato con sicurezza o canale diverso
             if (ap.record.ssid[0] != '\0') {
                 for (const auto& [k, existingAp] : ctx->seen) {
                     if (k != key && existingAp.record.ssid[0] != '\0' &&
                         strcmp(ap.record.ssid, existingAp.record.ssid) == 0 &&
-                        existingAp.record.authentication_type != ap.record.authentication_type) {
-                        char alertMsg[64];
-                        snprintf(alertMsg, sizeof(alertMsg), "Rogue AP clonato: %s", ap.record.ssid);
-                        triggerWidsAlert(ctx, WidsAttackType::RogueApClone, alertMsg, ap.record.bssid, (int)ap.record.channel, 1);
-                        break;
+                        (existingAp.record.authentication_type != ap.record.authentication_type || existingAp.record.channel != ap.record.channel)) {
+                        bool fromMe = isPacketFromMe(ctx, ap.record.bssid, ap.record.bssid, (int)ap.record.channel);
+                        if (!ctx->widsFilterSelf || !fromMe) {
+                            char alertMsg[64];
+                            snprintf(alertMsg, sizeof(alertMsg), "Rogue AP clonato: %s", ap.record.ssid);
+                            triggerWidsAlert(ctx, WidsAttackType::RogueApClone, alertMsg, ap.record.bssid, (int)ap.record.channel, 1);
+                            break;
+                        }
                     }
                 }
             }
@@ -2937,6 +2995,15 @@ void updateWidsDetailPage(Context* ctx) {
         lv_obj_set_style_bg_color(ctx->widsChannelModeButton, lock > 0 ? lv_color_hex(0xD97706) : lv_color_hex(0x181818), 0);
     }
 
+    if (ctx->widsFilterSelfButton != nullptr) {
+        lv_obj_t* lbl = lv_obj_get_child(ctx->widsFilterSelfButton, 0);
+        if (lbl != nullptr) {
+            lv_label_set_text(lbl, ctx->widsFilterSelf ? LV_SYMBOL_OK " FILTRA ME: ON" : LV_SYMBOL_CLOSE " FILTRA ME: OFF");
+        }
+        lv_obj_set_style_bg_color(ctx->widsFilterSelfButton, ctx->widsFilterSelf ? lv_color_hex(0x0D9488) : lv_color_hex(0x181818), 0);
+        lv_obj_set_style_border_color(ctx->widsFilterSelfButton, ctx->widsFilterSelf ? lv_color_hex(0x14B8A6) : lv_color_hex(0x505050), 0);
+    }
+
     if (ctx->widsThreatLabel != nullptr) {
         WidsAttackType threat = getRecentSevereThreat(ctx);
         char tBuf[128];
@@ -3075,7 +3142,8 @@ void createWidsDetailPage(Context* ctx, lv_obj_t* parent) {
         auto* ctx = static_cast<Context*>(lv_event_get_user_data(e));
         int curLock = getCaptureLockChannel();
         if (curLock <= 0) {
-            setCaptureLockChannel(1);
+            int hop = g_hopChannel.load();
+            setCaptureLockChannel((hop >= 1 && hop <= 13) ? hop : 1);
         } else {
             setCaptureLockChannel(0);
         }
@@ -3112,33 +3180,24 @@ void createWidsDetailPage(Context* ctx, lv_obj_t* parent) {
         updateWidsDetailPage(ctx);
     }, LV_EVENT_CLICKED, ctx);
 
-    // 4. Reset Log (Bottom-Right, alla dx di pcap)
-    ctx->widsClearButton = lv_button_create(btnGrid);
-    applyFocusStyle(ctx->widsClearButton);
-    lv_obj_set_width(ctx->widsClearButton, LV_PCT(48));
-    lv_obj_set_height(ctx->widsClearButton, LV_SIZE_CONTENT);
-    lv_obj_set_style_pad_ver(ctx->widsClearButton, 6, 0);
-    lv_obj_set_style_radius(ctx->widsClearButton, 4, 0);
-    lv_obj_set_style_border_width(ctx->widsClearButton, 1, 0);
-    lv_obj_set_style_border_color(ctx->widsClearButton, lv_color_hex(0x505050), 0);
-    lv_obj_set_style_bg_color(ctx->widsClearButton, lv_color_hex(0x181818), 0);
-    lv_obj_set_style_bg_opa(ctx->widsClearButton, LV_OPA_COVER, 0);
-    lv_obj_add_flag(ctx->widsClearButton, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
-    auto* clearLbl = lv_label_create(ctx->widsClearButton);
-    lv_label_set_text(clearLbl, LV_SYMBOL_TRASH " Reset Log");
-    lv_obj_center(clearLbl);
-    lv_obj_add_event_cb(ctx->widsClearButton, [](lv_event_t* e) {
+    // 4. Filtra Me (Bottom-Right, alla dx di pcap)
+    ctx->widsFilterSelfButton = lv_button_create(btnGrid);
+    applyFocusStyle(ctx->widsFilterSelfButton);
+    lv_obj_set_width(ctx->widsFilterSelfButton, LV_PCT(48));
+    lv_obj_set_height(ctx->widsFilterSelfButton, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_ver(ctx->widsFilterSelfButton, 6, 0);
+    lv_obj_set_style_radius(ctx->widsFilterSelfButton, 4, 0);
+    lv_obj_set_style_border_width(ctx->widsFilterSelfButton, 1, 0);
+    lv_obj_set_style_border_color(ctx->widsFilterSelfButton, lv_color_hex(0x505050), 0);
+    lv_obj_set_style_bg_color(ctx->widsFilterSelfButton, lv_color_hex(0x181818), 0);
+    lv_obj_set_style_bg_opa(ctx->widsFilterSelfButton, LV_OPA_COVER, 0);
+    lv_obj_add_flag(ctx->widsFilterSelfButton, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+    auto* filterLbl = lv_label_create(ctx->widsFilterSelfButton);
+    lv_label_set_text(filterLbl, ctx->widsFilterSelf ? LV_SYMBOL_OK " FILTRA ME: ON" : LV_SYMBOL_CLOSE " FILTRA ME: OFF");
+    lv_obj_center(filterLbl);
+    lv_obj_add_event_cb(ctx->widsFilterSelfButton, [](lv_event_t* e) {
         auto* ctx = static_cast<Context*>(lv_event_get_user_data(e));
-        if (ctx->mutex.lock(50 / portTICK_PERIOD_MS)) {
-            ctx->widsEvents.clear();
-            ctx->widsTotalAttacks = 0;
-            ctx->widsPeakDeauthRate.store(0);
-            ctx->widsMostSevereThreat.store(WidsAttackType::None);
-            ctx->widsSevereThreatTimestampMs = 0;
-            ctx->widsLogRenderedCount = (size_t)-1;
-            ctx->widsLogRenderedTime = 0;
-            ctx->mutex.unlock();
-        }
+        ctx->widsFilterSelf = !ctx->widsFilterSelf;
         updateWidsDetailPage(ctx);
     }, LV_EVENT_CLICKED, ctx);
 
@@ -4631,10 +4690,17 @@ void onTimer(Context* ctx) {
         if (deauths > ctx->widsPeakDeauthRate.load()) {
             ctx->widsPeakDeauthRate.store(deauths);
         }
-        if (deauths >= 15) {
-            int ch = getCaptureLockChannel();
+        if (deauths >= 3) {
+            int ch = ctx->widsLastAttackedChannel;
+            if (ch <= 0) ch = getCaptureLockChannel();
             if (ch <= 0) ch = getCurrentRadioChannel();
             triggerWidsAlert(ctx, WidsAttackType::DeauthFlood, "Deauth Flood Burst", ctx->widsLastAttackedBssid, ch, (uint16_t)deauths);
+        }
+        uint32_t newAps = ctx->widsNewBssidWindowCount.exchange(0);
+        if (newAps >= 6) {
+            int ch = getCaptureLockChannel();
+            if (ch <= 0) ch = getCurrentRadioChannel();
+            triggerWidsAlert(ctx, WidsAttackType::BeaconSpam, "Beacon Flood Spam", nullptr, ch, (uint16_t)newAps);
         }
     }
 
@@ -4759,7 +4825,7 @@ void destroyWidgets(void* userData) {
     ctx->widsMetricsLabel = nullptr;
     ctx->widsPcapButton = nullptr;
     ctx->widsChannelModeButton = nullptr;
-    ctx->widsClearButton = nullptr;
+    ctx->widsFilterSelfButton = nullptr;
     ctx->widsLogList = nullptr;
 
     ctx->widsGraphPage = nullptr;
@@ -4826,6 +4892,9 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
         .policy = WIFI_COUNTRY_POLICY_MANUAL
     };
     esp_wifi_set_country(&country);
+    esp_read_mac(ctx.myStaMac, ESP_MAC_WIFI_STA);
+    esp_read_mac(ctx.myApMac, ESP_MAC_WIFI_SOFTAP);
+    ctx.myMacValid = true;
 #endif
 
     saveLedConfig(&ctx);
@@ -4879,6 +4948,7 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
                         }
                         setCaptureLockChannel(channel);
                         sendDeauthBurstOnChannel(bssid, channel, nullptr);
+                        recordLocalAttack(&ctx, WidsAttackType::DeauthFlood, "Deauth Burst (Tactical)", bssid, channel, 6);
                         if (ctx.mutex.lock(250 / portTICK_PERIOD_MS)) {
                             ctx.deauthBurstsSent++;
                             ctx.mutex.unlock();
@@ -4912,6 +4982,7 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
                         }
                         setCaptureLockChannel(channel);
                         sendDeauthBurstOnChannel(bssid, channel, clientMac);
+                        recordLocalAttack(&ctx, WidsAttackType::DeauthFlood, "Client Deauth (Tactical)", bssid, channel, 6);
                         if (ctx.mutex.lock(250 / portTICK_PERIOD_MS)) {
                             ctx.deauthBurstsSent++;
                             ctx.mutex.unlock();
@@ -4942,6 +5013,7 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
                         }
                         setCaptureLockChannel(channel);
                         sendAssociationRequestBurst(bssid, ssid, channel);
+                        recordLocalAttack(&ctx, WidsAttackType::DeauthFlood, "Assoc/PMKID Flood (Tactical)", bssid, channel, 6);
                     }
                 } else if (event.result.launch_id == ctx.evilTwinDialogId.load() && event.result.result == 0) {
                     uint8_t bssid[6];
@@ -4969,6 +5041,7 @@ int32_t appMain(int /*argc*/, char* /*argv*/[]) {
                             setCaptureLockChannel(channel);
                             startEvilTwinAp(ssid[0] != '\0' ? ssid : "FreeWifi", channel);
                             sendDeauthBurstOnChannel(bssid, channel, nullptr);
+                            recordLocalAttack(&ctx, WidsAttackType::RogueApClone, "Rogue AP Clonato (Tactical)", bssid, channel, 1);
                         } else {
                             stopEvilTwinAp();
                             setCaptureLockChannel(0);
